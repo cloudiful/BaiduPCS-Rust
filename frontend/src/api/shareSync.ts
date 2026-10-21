@@ -244,9 +244,7 @@ export interface TriggerSubscriptionResponse {
 }
 
 /**
- * 取消扫描的结果。
- *
- * 只有扫描阶段可取消；已进入执行阶段时后端返回 409，调用方据此提示「无法取消」。
+ * 取消扫描的结果。只有扫描阶段可取消。
  */
 export interface CancelScanResponse {
   subscription_id: string
@@ -356,13 +354,8 @@ export async function resumeSubscription(id: string): Promise<void> {
 }
 
 /**
- * 取消当前正在进行的**扫描**（只影响扫描阶段，不影响订阅本身）。
- *
- * `runId` 必须是用户界面上观察到的那一轮：后端会先比对 run 身份再取消，
- * 迟到的旧请求不会取消新一轮的扫描。
- *
- * 当前没有扫描、轮次已变化或该轮已进入执行阶段时后端返回 409，
- * 调用方据此提示「无法取消」。
+ * 取消当前扫描（不影响订阅本身）。`runId` 是用户观察到的那一轮，后端先比对
+ * run 身份再取消，迟到请求不会取消新一轮；不可取消时返回 409。
  */
 export async function cancelScan(id: string, runId: string): Promise<CancelScanResponse> {
   const r = await rawApiClient.post<{ success: boolean; data: CancelScanResponse }>(

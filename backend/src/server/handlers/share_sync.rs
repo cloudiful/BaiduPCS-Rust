@@ -290,22 +290,19 @@ pub async fn trigger_subscription(
 
 /// 取消扫描的请求体。
 ///
-/// `run_id` 是**用户界面上观察到的那一轮**：取消必须绑定到具体某轮，否则迟到的
-/// 旧请求（例如上一轮点过取消、HTTP 才送达，而那一轮已结束、新一轮开始扫描）
-/// 会取消掉新一轮的扫描。缺失或与当前登记的扫描不一致时一律返回冲突（409），
-/// 绝不取消任何一轮。
+/// `run_id` 必须是用户观察到的那一轮：迟到的旧请求不得取消新一轮。缺失或不匹配
+/// 一律返回 409，且不取消任何一轮。
 #[derive(Debug, Deserialize)]
 pub struct CancelScanRequest {
-    /// 必填：当前扫描的 run_id
+    /// 必填：要取消的那一轮扫描
     #[serde(default)]
     pub run_id: Option<String>,
 }
 
 /// POST /api/v1/share-sync/subscriptions/:id/cancel-scan
 ///
-/// 取消当前正在进行的**扫描**（只影响扫描阶段，不影响订阅本身）。
-/// 请求体必须带上用户观察到的那一轮 `run_id`；当前没有扫描、或轮次已变化时
-/// 返回 409，由前端提示「无法取消」。
+/// 取消当前扫描（不影响订阅本身）：必须带上观察到的那一轮 `run_id`，
+/// 没有扫描、轮次已变化或已进入执行阶段时返回 409。
 pub async fn cancel_scan(
     State(state): State<AppState>,
     Path(id): Path<String>,

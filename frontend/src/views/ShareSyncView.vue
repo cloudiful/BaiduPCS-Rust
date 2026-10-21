@@ -696,10 +696,8 @@ function setScanProgress(id: string, st: Omit<ScanProgressState, 'received_at'> 
 }
 
 /**
- * 各订阅当前已知的最新一轮 run_id。
- *
- * 迟到的旧事件（旧轮的取消/完成结果）不得抹掉**新一轮**的扫描进度：所有
- * 「按订阅清理」的动作都先比对 run 身份，再决定要不要清。
+ * 各订阅当前已知的最新一轮 run_id。按订阅清理状态前先比对 run 身份，
+ * 迟到的旧事件不得抹掉新一轮的扫描进度。
  */
 const latestRunIds = ref<Map<string, string>>(new Map())
 
@@ -711,9 +709,7 @@ function noteLatestRun(subId: string, runId?: string | null) {
 }
 
 /**
- * 该事件是否仍对应当前订阅的最新一轮。
- *
- * 没见过任何一轮时（页面刚打开）按「是」处理 —— 事件本身就是唯一信息。
+ * 该事件是否仍对应当前订阅的最新一轮；尚无记录（页面刚打开）时视为最新。
  */
 function isLatestRun(subId: string, runId?: string | null): boolean {
   const latest = latestRunIds.value.get(subId)
@@ -723,10 +719,7 @@ function isLatestRun(subId: string, runId?: string | null): boolean {
 }
 
 /**
- * 只在状态仍属于该轮时清理扫描进度。
- *
- * 迟到的旧响应 / 旧事件不得抹掉新一轮的扫描进度（否则正在扫描的新一轮会
- * 突然「消失」，连取消入口都没了）。
+ * 只在状态仍属于该轮时清理扫描进度，避免旧响应/旧事件抹掉新一轮的取消入口。
  */
 function clearScanProgressForRun(subId: string, runId?: string | null): boolean {
   if (!isLatestRun(subId, runId)) return false
@@ -1414,13 +1407,11 @@ async function triggerNow(s?: ShareSubscription) {
 }
 
 /**
- * 取消当前正在进行的扫描。
+ * 取消当前扫描：只停扫描，订阅保持启用，已开始的转存/下载不受影响，
+ * 已进入执行阶段时后端返回 409 并如实提示。
  *
- * 只停扫描：订阅仍保持启用，已开始的转存/下载不受影响。
- * 后端在「已进入执行阶段」时会返回 409 —— 此时如实提示，不假装取消成功。
- *
- * 取消请求带上用户观察到的那一轮 run_id：迟到的旧请求既不会被后端执行，
- * 迟到的旧响应也不会抹掉新一轮的扫描进度。
+ * 请求带上观察到的那一轮 run_id：迟到请求不会执行，迟到的旧响应也不会
+ * 抹掉新一轮的扫描进度。
  */
 async function cancelScanNow(s?: ShareSubscription) {
   const target = s ?? selected.value
@@ -1431,7 +1422,7 @@ async function cancelScanNow(s?: ShareSubscription) {
   cancellingId.value = target.id
   try {
     await cancelScan(target.id, scan.run_id)
-    // 只清理这一轮的状态（REST 路径）；WS 事件到达时再清一次是幂等的
+    // WS 事件到达时还会再清一次（幂等）
     clearRunStateForRun(target.id, scan.run_id)
     ElMessage.success('已取消本次扫描')
     if (selected.value?.id === target.id) loadRuns(target.id)
@@ -1932,18 +1923,15 @@ onMounted(async () => {
       setScanProgress(sid, null)
     }
     if (evt.type === 'diff_detected') {
-      // 抓取阶段结束，进入执行段：撤掉扫描卡片，让位给子任务进度。
-      // 旧轮的 diff 事件不得撤掉新一轮的扫描卡片。
+      // 进入执行段，撤掉扫描卡片；旧轮的 diff 事件不得撤掉新一轮的卡片。
       clearScanProgressForRun(sid, evt.run_id)
     }
     if (evt.type === 'run_completed' || evt.type === 'run_failed') {
-      // 一轮结束：清空该订阅的进行中子任务与扫描进度。
       // 只清理仍属于这一轮的状态：迟到的旧完成事件不得抹掉新一轮的进度。
       clearRunStateForRun(sid, evt.run_id)
     }
     if (evt.type === 'run_cancelled') {
-      // 一轮被取消：同样清掉扫描卡片与子任务（取消只停扫描，不影响订阅本身）。
-      // 旧轮的取消事件不得抹掉新一轮的扫描进度。
+      // 取消只停扫描，不影响订阅；旧轮的取消事件不得抹掉新一轮的进度。
       clearRunStateForRun(sid, evt.run_id)
     }
     if (sid === selected.value?.id) {

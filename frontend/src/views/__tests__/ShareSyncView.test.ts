@@ -243,7 +243,7 @@ describe('ShareSyncView 取消扫描', () => {
     cancelButton()!.click()
     await flushPromises()
 
-    // 订阅仍保持启用：取消只停扫描，不禁用订阅
+    // 取消只停扫描，不改变订阅启用状态
     expect(api.setSubscriptionEnabled).not.toHaveBeenCalled()
     expect(cancelButton(), '取消失败时扫描卡片应保留').toBeTruthy()
     wrapper.unmount()
