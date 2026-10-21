@@ -29,7 +29,11 @@
               aria-label="同步内容使用说明"
               @click="showIncludeHelp = !showIncludeHelp"
           >
-            <el-icon class="help-icon"><QuestionFilled /></el-icon>使用说明
+            使用说明
+            <el-icon class="help-caret" aria-hidden="true">
+              <ArrowUp v-if="showIncludeHelp" />
+              <ArrowDown v-else />
+            </el-icon>
           </el-button>
         </div>
       </div>
@@ -77,7 +81,11 @@
               aria-label="排除目录使用说明"
               @click="showExcludeFolderHelp = !showExcludeFolderHelp"
           >
-            <el-icon class="help-icon"><QuestionFilled /></el-icon>使用说明
+            使用说明
+            <el-icon class="help-caret" aria-hidden="true">
+              <ArrowUp v-if="showExcludeFolderHelp" />
+              <ArrowDown v-else />
+            </el-icon>
           </el-button>
         </div>
       </div>
@@ -108,7 +116,11 @@
               aria-label="排除规则使用说明"
               @click="showExcludeHelp = !showExcludeHelp"
           >
-            <el-icon class="help-icon"><QuestionFilled /></el-icon>使用说明
+            使用说明
+            <el-icon class="help-caret" aria-hidden="true">
+              <ArrowUp v-if="showExcludeHelp" />
+              <ArrowDown v-else />
+            </el-icon>
           </el-button>
         </div>
       </div>
@@ -131,7 +143,7 @@
             :autosize="{ minRows: 1, maxRows: 4 }"
             resize="none"
             size="small"
-            placeholder="输入规则后回车添加；可粘贴多行一次添加（每行一条）"
+            placeholder="输入规则，每行一条"
             @keydown.enter="onExcludeEnter"
         />
         <el-button size="small" plain type="primary" @click="addExclude">添加</el-button>
@@ -153,13 +165,13 @@
         </template>
         <el-button
             size="small"
-            plain
+            text
             :icon="Star"
             :disabled="excludePatterns.length === 0 || savingPresets"
             :loading="savingPresets"
             @click="saveCurrentAsPresets"
         >存为常用</el-button>
-        <el-button size="small" plain :icon="Setting" @click="goManagePresets">管理常用规则</el-button>
+        <el-button size="small" text :icon="Setting" @click="goManagePresets">管理常用规则</el-button>
       </div>
     </div>
 
@@ -194,7 +206,7 @@ import { onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import type { AxiosError } from 'axios'
-import { FolderOpened, QuestionFilled, Setting, Star } from '@element-plus/icons-vue'
+import { ArrowDown, ArrowUp, FolderOpened, Setting, Star } from '@element-plus/icons-vue'
 import ShareFileSelector from './ShareFileSelector.vue'
 import ExcludeRuleHelp from './ExcludeRuleHelp.vue'
 import { getConfig, updateConfig } from '@/api/config'
@@ -436,15 +448,22 @@ function confirmPicker() {
 </script>
 
 <style scoped lang="scss">
-// 作为 el-form-item 的 flex 子项：默认 min-width:auto 会被输入框的固有宽度撑开，
-// 必须显式允许收缩到父级内容宽度。
+// 占满父级内容宽度并允许收缩。width:100% 固定宽度基准 —— 否则展开说明会改变
+// 固有宽度，右对齐的操作区随之横移；min-width:0 解除 flex 子项的固有宽度下限。
 .share-include-exclude-editor {
+  box-sizing: border-box;
+  width: 100%;
   min-width: 0;
   max-width: 100%;
 }
 
 .field-block {
   margin-bottom: 12px;
+}
+
+// 最后一个字段块不再叠加底部外边距，避免与父级表单间距重复。
+.field-block:last-of-type {
+  margin-bottom: 0;
 }
 
 // 头部一行：标题 + 状态 + 操作。窄屏允许换行，不强制单行不断。
@@ -479,8 +498,9 @@ function confirmPicker() {
   gap: 4px;
 }
 
-.help-icon {
-  margin-right: 2px;
+.help-caret {
+  margin-left: 2px;
+  font-size: 12px;
 }
 
 .path-tags {
@@ -521,8 +541,8 @@ function confirmPicker() {
 }
 
 .exclude-input {
-  flex: 0 1 280px;
-  width: 280px;
+  flex: 1 1 200px;
+  width: auto;
   min-width: 0;
   max-width: 100%;
 }

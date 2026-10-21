@@ -283,6 +283,32 @@ describe('ShareIncludeExcludeEditor 头部与折叠说明', () => {
     wrapper.unmount()
   })
 
+  it('使用说明箭头随展开状态切换，按钮文案不变且图标对辅助技术隐藏', async () => {
+    const wrapper = mountEditor()
+    await flushPromises()
+
+    const names = ['同步内容使用说明', '排除目录使用说明', '排除规则使用说明']
+    const caretOf = (name: string) => helpButton(name).querySelector<HTMLElement>('.help-caret')!
+    const closedCaret = new Map<string, string>()
+
+    for (const name of names) {
+      const caret = caretOf(name)
+      expect(caret, `${name} 应有状态箭头`).toBeTruthy()
+      expect(caret.getAttribute('aria-hidden'), `${name} 箭头应为装饰性`).toBe('true')
+      expect(caret.querySelector('svg'), `${name} 应渲染箭头图标`).toBeTruthy()
+      expect(helpButton(name).textContent?.trim(), `${name} 文案应保持不变`).toBe('使用说明')
+      closedCaret.set(name, caret.innerHTML)
+    }
+
+    for (const name of names) {
+      helpButton(name).click()
+      await flushPromises()
+      expect(helpButton(name).getAttribute('aria-expanded')).toBe('true')
+      expect(caretOf(name).innerHTML, `${name} 展开后箭头应切换`).not.toBe(closedCaret.get(name))
+    }
+    wrapper.unmount()
+  })
+
   it('展开排除规则说明复用既有说明组件，并可再次折叠', async () => {
     const wrapper = mountEditor()
     await flushPromises()
@@ -345,6 +371,21 @@ describe('ShareIncludeExcludeEditor 排除规则与常用词表', () => {
 
     const emitted = wrapper.emitted('update:excludePatterns')!
     expect(emitted[emitted.length - 1][0]).toEqual(['*.tmp', '*.bak'])
+    wrapper.unmount()
+  })
+
+  it('规则输入框占位符为「输入规则，每行一条」，与「添加」按钮同一行', async () => {
+    const wrapper = mountEditor()
+    await flushPromises()
+
+    const row = fieldBlock('排除规则').querySelector<HTMLElement>('.exclude-input-row')!
+    const textarea = row.querySelector<HTMLTextAreaElement>('textarea')
+    expect(textarea?.getAttribute('placeholder'), '占位符应为简短提示').toBe('输入规则，每行一条')
+    expect(row.querySelector('.exclude-input')?.contains(textarea!), '输入框应在输入行内').toBe(true)
+
+    const addBtn = Array.from(row.querySelectorAll('button')).find((b) => b.textContent?.trim() === '添加')
+    expect(addBtn, '输入行内应有「添加」按钮').toBeTruthy()
+    expect(fieldBlock('排除规则').querySelector('.field-label')?.textContent?.trim()).toBe('排除规则')
     wrapper.unmount()
   })
 
