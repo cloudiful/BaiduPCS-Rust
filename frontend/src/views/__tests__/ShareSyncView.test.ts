@@ -100,7 +100,11 @@ function mountView() {
         TransferDialog: true,
         ShareIncludeExcludeEditor: true,
         CronExprEditor: true,
-        FilePickerModal: true,
+        FilePickerModal: {
+          name: 'FilePickerModal',
+          props: ['modelValue', 'mode', 'title'],
+          template: '<div class="file-picker-stub" :data-visible="modelValue === true ? \'true\' : \'false\'" />',
+        },
       },
     },
   })
@@ -138,10 +142,189 @@ beforeEach(() => {
   })
   api.listRuns.mockReset().mockResolvedValue([])
   api.listSubtasks.mockReset().mockResolvedValue([])
+  api.updateSubscription.mockReset().mockResolvedValue(undefined)
 })
 
 afterEach(() => {
   document.body.innerHTML = ''
+})
+
+describe('ShareSyncView 订阅编辑弹窗同步目标', () => {
+  const SUB2 = {
+    ...SUB,
+    id: 'sub-2',
+    name: '另一份订阅',
+    targets: [{ kind: 'netdisk', remote_path: '/另一份网盘目录', save_fs_id: 0 }],
+  }
+
+  /** 订阅卡片里的「编辑」按钮（按订阅名定位卡片） */
+  function editButton(name: string): HTMLElement {
+    const card = Array.from(document.body.querySelectorAll<HTMLElement>('.config-card'))
+        .find((el) => el.textContent?.includes(name))
+    const btn = Array.from((card ?? document.body).querySelectorAll<HTMLElement>('button'))
+        .find((b) => b.textContent?.trim() === '编辑')
+    expect(btn, `「${name}」应有编辑按钮`).toBeTruthy()
+    return btn!
+  }
+
+  async function mountAndOpen(name: string) {
+    const wrapper = mountView()
+    await flushPromises()
+    editButton(name).click()
+    await flushPromises()
+    return wrapper
+  }
+
+  const dialog = () => document.body.querySelector<HTMLElement>('.subscription-dialog')
+  const switches = () => Array.from(document.body.querySelectorAll<HTMLElement>('.subscription-dialog .el-switch'))
+  const pathInputs = () => Array.from(document.body.querySelectorAll<HTMLInputElement>('.subscription-dialog .target-path input'))
+  const pickButton = () => document.body.querySelector<HTMLButtonElement>('.subscription-dialog .target-path .el-input-group__append button')
+  const pickerStub = () => document.body.querySelector<HTMLElement>('.file-picker-stub')
+
+  it('对话框使用居中布局并固定头部/底部、主体滚动', async () => {
+    const wrapper = await mountAndOpen(SUB.name)
+
+    const el = dialog()
+    expect(el, '应渲染编辑弹窗').toBeTruthy()
+    expect(el!.classList.contains('is-align-center'), '应启用居中').toBe(true)
+    expect(el!.querySelector('.el-dialog__header')).toBeTruthy()
+    expect(el!.querySelector('.el-dialog__body .el-form'), '表单应在对话框主体内').toBeTruthy()
+    expect(el!.querySelector('.el-dialog__footer')?.textContent).toContain('保存')
+    wrapper.unmount()
+  })
+
+  it('关闭网盘目标后路径仍可见，重新开启原样恢复', async () => {
+    const wrapper = await mountAndOpen(SUB.name)
+
+    const [netdiskSwitch] = switches()
+    const [netdiskInput] = pathInputs()
+    expect(netdiskInput.disabled, '网盘目标默认关闭，输入框应禁用').toBe(true)
+
+    netdiskSwitch.click()
+    await flushPromises()
+    expect(netdiskInput.disabled).toBe(false)
+
+    netdiskInput.value = '/我的资源/同步'
+    netdiskInput.dispatchEvent(new Event('input'))
+    await flushPromises()
+
+    netdiskSwitch.click()
+    await flushPromises()
+    expect(pathInputs()[0].disabled, '关闭后仍禁用展示').toBe(true)
+    expect(pathInputs()[0].value, '关闭后应保留草稿路径').toBe('/我的资源/同步')
+
+    netdiskSwitch.click()
+    await flushPromises()
+    expect(pathInputs()[0].value, '重新开启应恢复草稿').toBe('/我的资源/同步')
+    wrapper.unmount()
+  })
+
+  it('仅剩一个目标时不能关闭，并提示至少保留一个', async () => {
+    const wrapper = await mountAndOpen(SUB.name)
+
+    const [, localSwitch] = switches()
+    expect(localSwitch.classList.contains('is-checked'), '本地目标默认启用').toBe(true)
+
+    localSwitch.click()
+    await flushPromises()
+
+    expect(switches()[1].classList.contains('is-checked'), '不可关闭最后一个目标').toBe(true)
+    expect(document.body.textContent).toContain('至少需要开启一个同步目标')
+    wrapper.unmount()
+  })
+
+  it('保存只提交启用的目标，本地模式随网盘目标推导', async () => {
+    api.updateSubscription.mockResolvedValue({ ...SUB })
+    const wrapper = await mountAndOpen(SUB.name)
+
+    // 仅本地：分享直下
+    Array.from(document.body.querySelectorAll<HTMLElement>('button'))
+        .find((b) => b.textContent?.trim() === '保存')!.click()
+    await flushPromises()
+    expect(api.updateSubscription).toHaveBeenCalledTimes(1)
+    let req = api.updateSubscription.mock.calls[0][1] as { targets: Array<Record<string, unknown>> }
+    expect(req.targets).toEqual([
+      { kind: 'local', local_path: '/tmp', mode: 'share_direct' },
+    ])
+
+    // 开启网盘后再保存：本地改为转存并下载
+    editButton(SUB.name).click()
+    await flushPromises()
+    switches()[0].click()
+    await flushPromises()
+    const netdiskInput = pathInputs()[0]
+    netdiskInput.value = '/我的资源/同步'
+    netdiskInput.dispatchEvent(new Event('input'))
+    await flushPromises()
+    Array.from(document.body.querySelectorAll<HTMLElement>('button'))
+        .find((b) => b.textContent?.trim() === '保存')!.click()
+    await flushPromises()
+
+    expect(api.updateSubscription).toHaveBeenCalledTimes(2)
+    req = api.updateSubscription.mock.calls[1][1] as { targets: Array<Record<string, unknown>> }
+    expect(req.targets).toEqual([
+      { kind: 'netdisk', remote_path: '/我的资源/同步', save_fs_id: 0 },
+      { kind: 'local', local_path: '/tmp', mode: 'transfer_and_download' },
+    ])
+    wrapper.unmount()
+  })
+
+  it('本地目标关闭时选择按钮禁用且不打开目录选择器', async () => {
+    const wrapper = await mountAndOpen(SUB.name)
+
+    const [, localSwitch] = switches()
+    // 先开启网盘，才能关闭本地目标
+    switches()[0].click()
+    await flushPromises()
+    localSwitch.click()
+    await flushPromises()
+
+    const btn = pickButton()
+    expect(btn, '本地行的选择按钮应始终存在').toBeTruthy()
+    expect(btn!.disabled, '本地目标关闭时选择按钮应禁用').toBe(true)
+    expect(pickerStub()?.getAttribute('data-visible'), '目录选择器不应打开').toBe('false')
+    expect(pathInputs()[1].disabled, '本地路径输入应禁用').toBe(true)
+    wrapper.unmount()
+  })
+
+  it('禁用目标的草稿不跨订阅泄漏', async () => {
+    api.listSubscriptions.mockResolvedValue([SUB2, SUB])
+    const wrapper = mountView()
+    await flushPromises()
+
+    editButton(SUB2.name).click()
+    await flushPromises()
+    expect(pathInputs()[0].value, '另一份订阅的网盘路径').toBe('/另一份网盘目录')
+    switches()[0].click()
+    await flushPromises()
+    expect(pathInputs()[0].value, '关闭后仍保留该订阅草稿').toBe('/另一份网盘目录')
+
+    Array.from(document.body.querySelectorAll<HTMLElement>('button'))
+        .find((b) => b.textContent?.trim() === '取消')!.click()
+    await flushPromises()
+
+    editButton(SUB.name).click()
+    await flushPromises()
+    expect(switches()[0].classList.contains('is-checked'), '另一个订阅默认无网盘目标').toBe(false)
+    expect(pathInputs()[0].value, '不得显示上一个订阅的草稿').toBe('/')
+    wrapper.unmount()
+  })
+
+  it('取消不写接口，关闭后草稿重置', async () => {
+    const wrapper = await mountAndOpen(SUB.name)
+
+    switches()[0].click()
+    await flushPromises()
+    Array.from(document.body.querySelectorAll<HTMLElement>('button'))
+        .find((b) => b.textContent?.trim() === '取消')!.click()
+    await flushPromises()
+
+    expect(api.updateSubscription).not.toHaveBeenCalled()
+    editButton(SUB.name).click()
+    await flushPromises()
+    expect(pathInputs()[0].value, '关闭后草稿应重置').toBe('/')
+    wrapper.unmount()
+  })
 })
 
 describe('ShareSyncView 取消扫描', () => {
