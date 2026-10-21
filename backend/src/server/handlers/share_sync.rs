@@ -68,6 +68,7 @@ fn map_share_err(e: ShareSyncError) -> ApiError {
         ShareSyncError::SubscriptionNotFound(m) => err_not_found(&m),
         ShareSyncError::SubscriptionExists(m) => ApiError::Conflict(m),
         ShareSyncError::AlreadyRunning(m) => ApiError::Conflict(m),
+        ShareSyncError::ScanNotCancellable(m) => ApiError::Conflict(m),
         ShareSyncError::ConfigError(m) => err_bad(&m),
         ShareSyncError::ShareLinkError(m) => err_bad(&m),
         ShareSyncError::FileSystemError(m) => err_bad(&m),
@@ -87,6 +88,7 @@ fn map_share_err(e: ShareSyncError) -> ApiError {
         ShareSyncError::TransferError(m) => err_bad(&m),
         ShareSyncError::DownloadError(m) => err_bad(&m),
         ShareSyncError::SchedulerError(m) => err_bad(&m),
+        ShareSyncError::ScanCancelled(m) => err_bad(&m),
         ShareSyncError::Internal(m) => err_internal(&m),
     }
 }
@@ -183,6 +185,9 @@ pub async fn update_subscription(
     }
     if let Some(v) = req.exclude_patterns {
         new_sub.exclude_patterns = v;
+    }
+    if let Some(v) = req.exclude_paths {
+        new_sub.exclude_paths = v;
     }
     if let Some(v) = req.targets {
         new_sub.targets = v;
@@ -283,12 +288,53 @@ pub async fn trigger_subscription(
     }))))
 }
 
+/// 取消扫描的请求体。
+///
+/// `run_id` 是**用户界面上观察到的那一轮**：取消必须绑定到具体某轮，否则迟到的
+/// 旧请求（例如上一轮点过取消、HTTP 才送达，而那一轮已结束、新一轮开始扫描）
+/// 会取消掉新一轮的扫描。缺失或与当前登记的扫描不一致时一律返回冲突（409），
+/// 绝不取消任何一轮。
+#[derive(Debug, Deserialize)]
+pub struct CancelScanRequest {
+    /// 必填：当前扫描的 run_id
+    #[serde(default)]
+    pub run_id: Option<String>,
+}
+
+/// POST /api/v1/share-sync/subscriptions/:id/cancel-scan
+///
+/// 取消当前正在进行的**扫描**（只影响扫描阶段，不影响订阅本身）。
+/// 请求体必须带上用户观察到的那一轮 `run_id`；当前没有扫描、或轮次已变化时
+/// 返回 409，由前端提示「无法取消」。
+pub async fn cancel_scan(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<CancelScanRequest>,
+) -> ApiResult<Json<ApiResponse<serde_json::Value>>> {
+    tracing::info!("share-sync: POST /subscriptions/{}/cancel-scan", id);
+    let m = get_manager(&state).await?;
+    require_subscription(&m, &id)?;
+    let expected_run_id = req.run_id.unwrap_or_default().trim().to_string();
+    if expected_run_id.is_empty() {
+        return Err(ApiError::Conflict(
+            "缺少 run_id：无法确认要取消哪一轮扫描".to_string(),
+        ));
+    }
+    let outcome = m
+        .cancel_scan(&id, &expected_run_id)
+        .map_err(map_share_err)?;
+    Ok(Json(ApiResponse::success(serde_json::json!({
+        "subscription_id": id,
+        "run_id": outcome.run_id,
+        "cancelled": true,
+    }))))
+}
+
 #[derive(Debug, Deserialize)]
 pub struct RunsQuery {
     pub page: Option<usize>,
     pub page_size: Option<usize>,
 }
-
 #[derive(Debug, Deserialize)]
 pub struct RunItemsQuery {
     pub page: Option<usize>,
