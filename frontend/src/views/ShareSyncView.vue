@@ -336,6 +336,8 @@
     <!-- 创建/编辑对话框 -->
     <el-dialog
         v-model="dialogVisible"
+        class="subscription-dialog"
+        align-center
         title="编辑订阅"
         width="640px"
         @close="resetForm"
@@ -370,38 +372,49 @@
         </el-form-item>
         <el-form-item label="同步目标">
           <div class="sync-mode-editor">
-            <div class="sync-toggle-row">
-              <el-switch v-model="netdiskEnabled" />
-              <span class="sync-toggle-label">转存到网盘</span>
-            </div>
-            <div v-if="netdiskEnabled" class="mode-target-row">
-              <span class="mode-target-label">网盘目录</span>
-              <el-input
-                  v-model="netdiskRemotePath"
-                  placeholder="网盘路径，如 /我的资源/同步"
-                  style="flex: 1"
-              />
-            </div>
-
-            <div class="sync-toggle-row">
-              <el-switch v-model="localEnabled" />
-              <span class="sync-toggle-label">下载到本地</span>
-            </div>
-            <div v-if="localEnabled" class="mode-target-row">
-              <span class="mode-target-label">本地目录</span>
-              <span
-                  class="mode-target-value"
-                  :class="{ 'is-placeholder': !localTargetPath }"
-                  @click="openDirPicker()"
-              >
-                {{ localTargetPath || '点击选择本地目录' }}
-              </span>
-              <el-button :icon="FolderOpened" @click="openDirPicker()" style="margin-left: 4px">
-                选择
-              </el-button>
+            <div class="target-row">
+              <div class="target-switch">
+                <el-switch v-model="netdiskEnabled" aria-label="转存到网盘" />
+                <span class="target-label">转存到网盘</span>
+              </div>
+              <div class="target-path">
+                <el-input
+                    v-model="netdiskRemotePath"
+                    :disabled="!netdiskEnabled"
+                    aria-label="网盘目录"
+                    placeholder="网盘路径，如 /我的资源/同步"
+                />
+              </div>
             </div>
 
-            <div class="sync-mode-hint">{{ syncModeHint }}</div>
+            <div class="target-row">
+              <div class="target-switch">
+                <el-switch v-model="localEnabled" aria-label="下载到本地" />
+                <span class="target-label">下载到本地</span>
+              </div>
+              <div class="target-path">
+                <el-input
+                    v-model="localTargetPath"
+                    readonly
+                    clearable
+                    :disabled="!localEnabled"
+                    aria-label="本地目录"
+                    placeholder="点击「选择」指定本地目录"
+                    @clear="localTargetPath = ''"
+                >
+                  <template #append>
+                    <el-button
+                        :icon="FolderOpened"
+                        :disabled="!localEnabled"
+                        aria-label="选择本地目录"
+                        @click="openDirPicker()"
+                    >选择</el-button>
+                  </template>
+                </el-input>
+              </div>
+            </div>
+
+            <div v-if="syncModeHint" class="sync-mode-hint">{{ syncModeHint }}</div>
           </div>
         </el-form-item>
         <el-form-item label="轮询">
@@ -876,6 +889,20 @@ function findLocalTarget(): LocalTarget | undefined {
   return form.value.targets.find((t): t is LocalTarget => t.kind === 'local')
 }
 
+// 关闭的开关只在表单里移除目标，但路径等草稿留在本次对话框会话里，
+// 重新打开时原样恢复（不写回订阅、不跨订阅/新建泄漏）。
+const netdiskDraft = ref<NetdiskTarget>({ kind: 'netdisk', remote_path: '/', save_fs_id: 0, conflict_strategy: null })
+const localDraft = ref<LocalTarget>({ kind: 'local', local_path: '', conflict_strategy: null, mode: 'share_direct' })
+
+function seedTargetDrafts(targets: SyncTarget[]) {
+  const nd = targets.find((t): t is NetdiskTarget => t.kind === 'netdisk')
+  const lo = targets.find((t): t is LocalTarget => t.kind === 'local')
+  netdiskDraft.value = nd
+      ? { ...nd }
+      : { kind: 'netdisk', remote_path: '/', save_fs_id: 0, conflict_strategy: null }
+  localDraft.value = lo ? { ...lo } : { kind: 'local', local_path: '', conflict_strategy: null, mode: 'share_direct' }
+}
+
 // 按开关重建目标列表，尽量保留已填的网盘/本地路径，避免误清空
 function rebuildTargets(netdisk: boolean, local: boolean) {
   if (!netdisk && !local) {
@@ -884,18 +911,15 @@ function rebuildTargets(netdisk: boolean, local: boolean) {
   }
   const nd = findNetdiskTarget()
   const lo = findLocalTarget()
-  const remotePath = nd?.remote_path ?? '/'
-  const saveFsId = nd?.save_fs_id ?? 0
-  const localPath = lo?.local_path ?? ''
-  const ndStrategy = nd?.conflict_strategy ?? null
-  const loStrategy = lo?.conflict_strategy ?? null
+  if (nd) netdiskDraft.value = { ...nd }
+  if (lo) localDraft.value = { ...lo }
   const next: SyncTarget[] = []
   if (netdisk) {
-    next.push({ kind: 'netdisk', remote_path: remotePath, save_fs_id: saveFsId, conflict_strategy: ndStrategy })
+    next.push({ ...netdiskDraft.value })
   }
   if (local) {
     // 有网盘目标=转存并下载（复用网盘副本）；无=分享直下。后端最终按目标存在性推导，这里保持一致。
-    next.push({ kind: 'local', local_path: localPath, conflict_strategy: loStrategy, mode: netdisk ? 'transfer_and_download' : 'share_direct' })
+    next.push({ ...localDraft.value, mode: netdisk ? 'transfer_and_download' : 'share_direct' })
   }
   form.value.targets = next
 }
@@ -912,23 +936,25 @@ const localEnabled = computed<boolean>({
 const syncModeHint = computed(() => {
   const nd = netdiskEnabled.value
   const lo = localEnabled.value
-  if (nd && lo) return '转存到网盘目录并保留，再从这份网盘副本下载到本地（只转存一次，不会重复转存）。'
-  if (nd) return '只把分享内容转存到指定网盘目录并保留，不下载到本地。'
-  return '分享直下：转存到临时目录后下载到本地，下载完成即清理，网盘不留存。'
+  if (nd && lo) return '从网盘副本下载到本地，网盘保留。'
+  if (nd) return ''
+  return '下载后清理网盘临时文件。'
 })
 
 const netdiskRemotePath = computed<string>({
-  get() { return findNetdiskTarget()?.remote_path ?? '' },
+  get() { return findNetdiskTarget()?.remote_path ?? netdiskDraft.value.remote_path },
   set(v: string) {
     const nd = findNetdiskTarget()
     if (nd) nd.remote_path = v
+    netdiskDraft.value.remote_path = v
   },
 })
 const localTargetPath = computed<string>({
-  get() { return findLocalTarget()?.local_path ?? '' },
+  get() { return findLocalTarget()?.local_path ?? localDraft.value.local_path },
   set(v: string) {
     const lo = findLocalTarget()
     if (lo) lo.local_path = v
+    localDraft.value.local_path = v
   },
 })
 
@@ -964,6 +990,7 @@ const defaultForm = (): {
 })
 
 const form = ref(defaultForm())
+seedTargetDrafts(form.value.targets)
 
 function normalizePollConfigForUi(p?: PollConfig | null): PollConfig {
   const rawMode = p?.mode || 'interval'
@@ -1122,6 +1149,7 @@ function openEdit(s?: ShareSubscription) {
     form.value.poll_config.schedule_hour = null
     form.value.poll_config.schedule_minute = null
   }
+  seedTargetDrafts(form.value.targets)
   dialogVisible.value = true
 }
 
@@ -1137,6 +1165,7 @@ function getApiErrorMessage(e: unknown): string {
 
 function resetForm() {
   formRef.value?.resetFields?.()
+  seedTargetDrafts(defaultForm().targets)
 }
 
 async function saveForm() {
@@ -1470,6 +1499,7 @@ const dirPickerDefaultDir = computed(
 )
 
 function openDirPicker() {
+  if (!findLocalTarget()) return
   dirPickerVisible.value = true
 }
 
@@ -2228,36 +2258,55 @@ onUnmounted(() => {
 .target-form-row { display: flex; align-items: center; margin-bottom: 8px; }
 .target-tip { margin-left: 8px; font-size: 12px; color: #909399; }
 
+// 订阅编辑弹窗：头部与底部固定，只有表单主体滚动；四周至少保留 16px 视口边距。
+:deep(.subscription-dialog) {
+  display: flex;
+  flex-direction: column;
+  max-width: calc(100vw - 32px);
+  max-height: calc(100vh - 32px);
+  max-height: calc(100dvh - 32px);
+
+  .el-dialog__header,
+  .el-dialog__footer {
+    flex: 0 0 auto;
+  }
+
+  .el-dialog__body {
+    flex: 1 1 auto;
+    min-height: 0;
+    overflow-y: auto;
+  }
+}
+
 .sync-mode-editor {
   width: 100%;
+
   .sync-mode-hint { margin: 8px 0 4px; font-size: 12px; color: #909399; }
-  .mode-target-row {
+
+  .target-row {
     display: flex;
     align-items: center;
+    flex-wrap: wrap;
+    gap: 4px 8px;
     margin-top: 8px;
-    .mode-target-label {
-      width: 64px;
-      flex-shrink: 0;
-      font-size: 13px;
-      color: #606266;
-    }
-    .mode-target-value {
-      flex: 1;
-      min-width: 0;
-      padding: 0 11px;
-      height: 32px;
-      line-height: 32px;
-      border: 1px solid var(--el-border-color);
-      border-radius: 4px;
-      font-size: 14px;
-      color: #303133;
-      cursor: pointer;
-      overflow: hidden;
-      text-overflow: ellipsis;
-      white-space: nowrap;
-      &:hover { border-color: var(--el-color-primary); }
-      &.is-placeholder { color: #a8abb2; }
-    }
+  }
+
+  .target-switch {
+    display: flex;
+    align-items: center;
+    flex-shrink: 0;
+    gap: 6px;
+  }
+
+  .target-label {
+    font-size: 13px;
+    color: #606266;
+    white-space: nowrap;
+  }
+
+  .target-path {
+    flex: 1 1 240px;
+    min-width: 0;
   }
 }
 
