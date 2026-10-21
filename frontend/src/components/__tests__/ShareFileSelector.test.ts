@@ -141,7 +141,6 @@ describe('ShareFileSelector 仅选文件夹模式', () => {
     const wrapper = mountSelector(true)
     await flushPromises()
 
-    // 进入子目录（此时根列表被替换），再返回根目录
     itemByName('剧集').click()
     await flushPromises()
     const rootBtn = Array.from(document.body.querySelectorAll<HTMLElement>('button'))
@@ -150,7 +149,7 @@ describe('ShareFileSelector 仅选文件夹模式', () => {
     rootBtn!.click()
     await flushPromises()
 
-    // 该文件夹已被展开过（存在子项记录），勾选它仍应只选中文件夹本身
+    // 已展开过的文件夹，勾选后仍只选中自身
     const dirCheckbox = itemByName('剧集').querySelector<HTMLInputElement>('input[type="checkbox"]')
     expect(dirCheckbox).toBeTruthy()
     dirCheckbox!.click()

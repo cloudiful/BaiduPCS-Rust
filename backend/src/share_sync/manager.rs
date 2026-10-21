@@ -56,8 +56,7 @@ const SCAN_STAGE_CANCELLED: u8 = 2;
 
 /// 一轮扫描的可取消句柄。
 ///
-/// 带 `run_id` 是为了「run 身份安全」：清理时只移除**本轮**登记的句柄，
-/// 绝不能把下一轮的令牌一起删掉、也不能取消下一轮的扫描。
+/// `run_id` 用于把取消请求绑定到用户看到的那一轮：身份不符的迟到请求不得取消新一轮。
 #[derive(Clone)]
 struct ScanHandle {
     run_id: String,
@@ -109,8 +108,8 @@ impl ScanHandle {
 
 /// RAII 守卫：run 结束时移除本轮登记的取消句柄。
 ///
-/// 只移除**本轮**登记的那一个（按 `run_id` 比对）—— 否则旧 run 收尾时会把新一轮
-/// 的令牌一起删掉，新一轮就再也取消不了。
+/// 只移除按 `run_id` 比对属于本轮的那一个，否则旧 run 收尾会删掉新一轮的令牌，
+/// 新一轮就再也取消不了。
 struct ScanHandleGuard<'g> {
     handles: &'g DashMap<String, ScanHandle>,
     sub_id: String,
@@ -144,10 +143,7 @@ pub struct ShareSyncManager {
     /// 启动期待续跑、但 `resume_interrupted_runs` 还没处理到的订阅。在此集合里的订阅
     /// 不许起新一轮：新一轮开头的 `sweep_residual_subtasks` 会删掉待接管的残留下载。
     pending_resume: DashMap<String, ()>,
-    /// 正在扫描中的订阅 → 本轮的可取消句柄。
-    ///
-    /// 只登记「当前这一轮」，run 结束即移除（移除时按 `run_id` 比对，
-    /// 绝不误删下一轮登记的句柄）。
+    /// 订阅 ID → 本轮扫描的可取消句柄；run 结束即按 `run_id` 比对移除。
     scan_handles: DashMap<String, ScanHandle>,
     /// 持久化层
     persistence: Arc<ShareSyncPersistence>,
@@ -1521,18 +1517,13 @@ impl ShareSyncManager {
         self.execute_one_with_run_id(id, None).await
     }
 
-    /// 取消当前正在进行的**扫描**。
+    /// 取消**当前这一轮**的扫描。
     ///
-    /// 只接受「扫描中」这一阶段：扫描已结束并进入执行阶段后一律拒绝（返回
-    /// `ScanNotCancellable` → HTTP 409），避免取消掉已经开始的转存/下载。
-    /// 当前没有扫描在跑时同样返回冲突，调用方据此提示用户。
+    /// 只接受「扫描中」阶段：已进入执行阶段一律拒绝（`ScanNotCancellable` → 409），
+    /// 避免取消掉已经开始的转存/下载。
     ///
-    /// `expected_run_id` 是**用户界面上观察到的那一轮**。它必须与当前登记的扫描
-    /// 完全一致才接受取消：迟到的旧请求（上一轮点过取消、HTTP 才送达，而那一轮
-    /// 已经结束、新一轮开始扫描）否则会取消掉**新一轮**的扫描。身份比对发生在
-    /// 阶段 CAS **之前**，不匹配一律是确定性冲突，且不触碰任何令牌。
-    ///
-    /// 取消只作用于**当前这一轮**：令牌是按 run 生成的，不会波及其它轮次。
+    /// `expected_run_id` 是用户界面上观察到的那一轮。身份比对在阶段 CAS **之前**：
+    /// 不匹配（含迟到的旧请求）即确定性冲突，且不触碰任何令牌，因此不会取消新一轮。
     pub fn cancel_scan(
         &self,
         id: &str,
@@ -1545,7 +1536,7 @@ impl ShareSyncManager {
             .ok_or_else(|| {
                 ShareSyncError::ScanNotCancellable("当前没有正在进行的扫描，无法取消".into())
             })?;
-        // 先比对 run 身份，再做阶段 CAS：身份不符时连令牌都不碰。
+        // 身份比对先于阶段 CAS：不符时连令牌都不碰。
         if handle.run_id != expected_run_id {
             return Err(ShareSyncError::ScanNotCancellable(
                 "扫描轮次已变化，无法取消（请刷新后重试）".into(),
@@ -1684,21 +1675,19 @@ impl ShareSyncManager {
             }
         };
 
-        // 登记本轮的取消句柄 —— 必须在扫描开始**之前**登记，否则「扫描已开始」与
-        // 「可取消」之间会留一个空窗（用户点取消只会收到「没有正在进行的扫描」）。
+        // 必须在扫描开始**之前**登记，否则扫描已开始但还不可取消。
         let scan_handle = ScanHandle::new(run_id.clone());
         self.scan_handles
             .insert(id.to_string(), scan_handle.clone());
 
-        // RAII 守卫：无论从哪条分支返回都移除句柄，且**只移除本轮登记的那一个** ——
-        // 绝不能把下一轮的令牌一起删掉（那会让下一轮永远无法被取消）。
+        // 守卫在收尾时按 `run_id` 只移除本轮登记的句柄。
         let _scan_handle_guard = ScanHandleGuard {
             handles: &self.scan_handles,
             sub_id: id.to_string(),
             run_id: run_id.clone(),
         };
 
-        // 0) 清掉上一轮遗留的、没人再驱动的内部子任务。        //
+        // 0) 清掉上一轮遗留的、没人再驱动的内部子任务。
         // 到这里 `running` 已被本次 run 独占（`resume_run_in_place` 走同一把守卫），
         // 所以此刻还挂在本订阅名下的转存/下载任务必然是**孤儿**：上一轮 run 已经
         // 结束（超时、失败、或进程被杀后没走到启动续跑），没有任何 run 在等它们。
@@ -1779,8 +1768,7 @@ impl ShareSyncManager {
         let (captured, curr_snapshot) = {
             let scan_token = scan_handle.token.clone();
             let collector_token = scan_token.clone();
-            // 取消要能打断「等待请求 / 重试退避 / 限速等待 / 网络往返」——
-            // 用 select 让取消信号与扫描 future 竞争，谁先到谁赢。
+            // 用 select 让取消信号与整个扫描 future 竞争，可打断请求、重试退避与限速等待。
             let outcome = tokio::select! {
                 biased;
                 _ = scan_token.cancelled() => Err(ShareSyncError::ScanCancelled("用户取消扫描".into())),
@@ -1911,8 +1899,7 @@ impl ShareSyncManager {
 
         // 4) 执行
         //
-        // 进入执行阶段前原子地推进状态机：若这一步失败，说明扫描期间（或 diff 期间）
-        // 收到了取消 —— 此时**不得**执行转存/下载，也不得推进快照基线。
+        // 推进阶段失败说明已被取消：不得执行转存/下载，也不得推进快照基线。
         if !scan_handle.try_enter_executing() {
             self.finish_cancelled_run(&run_id, id, owner_uid);
             return Err(ShareSyncError::ScanCancelled("用户取消扫描".into()));
@@ -2123,8 +2110,7 @@ impl ShareSyncManager {
 
     /// 把被用户取消的 run 收尾成 `cancelled`（**不是**失败）。
     ///
-    /// 取消不是错误：不计入链接失效计数、不触发重试、不推进快照基线，
-    /// 候选快照一并作废（留着只会累积，且可能被误当成基线候选）。
+    /// 取消不是错误：不计链接失效、不重试、不推进快照基线，候选快照一并作废。
     fn finish_cancelled_run(&self, run_id: &str, sub_id: &str, owner_uid: u64) {
         let now = chrono::Utc::now().timestamp();
         // run 行可能还没落库（trigger 预建的行已在库里，这里兜底补一行）

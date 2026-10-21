@@ -266,7 +266,7 @@ pub struct SnapshotCollector<'a> {
     include_index: BTreeSet<String>,
     /// 排除规则（精确目录路径 + glob 模式）
     exclusions: ExclusionRules,
-    /// 取消令牌：扫描阶段被用户取消时立即中断（等待请求 / 重试 / 限速都会被唤醒）
+    /// 取消令牌：触发后立即中断扫描
     cancel: Option<CancellationToken>,
     /// v2 阶段 6 补全:列目录抓快照同样走全局风控限速器。
     /// 与 ProductionHooks 的 submit_transfer/submit_download 共用同一个令牌桶,
@@ -378,7 +378,7 @@ impl<'a> SnapshotCollector<'a> {
         self
     }
 
-    /// 注入取消令牌：扫描阶段被取消时立刻中断，不再发新的目录请求
+    /// 注入取消令牌，扫描阶段被取消时立即中断
     pub fn with_cancel(mut self, token: CancellationToken) -> Self {
         self.cancel = Some(token);
         self
@@ -465,8 +465,6 @@ impl<'a> SnapshotCollector<'a> {
             self.include_paths = remapped;
         }
 
-        // 精确排除目录同样要归一到「相对分享根」命名空间，否则非根分享（分享根是某个
-        // 目录）里按绝对路径挑的排除目录会匹配不到任何条目 —— 表现为「排除没生效」。
         self.exclusions.remap_exact_paths(&share_root);
 
         self.check_cancelled()?;
@@ -480,7 +478,7 @@ impl<'a> SnapshotCollector<'a> {
         let mut dirs_done: usize = 0;
         let mut cached_hits: usize = 0;
 
-        // 推入 root（与子目录吸收走同一段逻辑：被排除的目录在这里就不会入队）
+        // 推入 root（与子目录吸收共用同一段逻辑，排除规则因此同样生效）
         {
             let mut root_queue: VecDeque<String> = VecDeque::new();
             absorb_entries(
@@ -650,9 +648,7 @@ impl<'a> SnapshotCollector<'a> {
         }
     }
 
-    /// 扫描被取消 → 立刻返回错误，终止本轮抓取。
-    ///
-    /// 检查点覆盖 BFS 每个目录与每个分页，因此取消不会等到「列完整个目录」才生效。
+    /// 扫描被取消即返回错误；检查点覆盖每个目录与分页。
     fn check_cancelled(&self) -> Result<(), ShareSyncError> {
         cancelled_error(self.cancel.as_ref())
     }
@@ -815,9 +811,9 @@ fn compile_exclude_patterns(patterns: &[String]) -> Option<RegexSet> {
     RegexSet::new(&regexes).ok()
 }
 
-/// 取消检查：令牌已触发时返回「扫描已取消」，否则 `Ok(())`。
+/// 取消检查：令牌已触发时返回「扫描已取消」。
 ///
-/// 抽成自由函数是为了能脱离 collector（不依赖网络客户端）被单元测试直接驱动。
+/// 自由函数形式便于脱离 collector 直接测试。
 pub fn cancelled_error(cancel: Option<&CancellationToken>) -> Result<(), ShareSyncError> {
     if cancel.is_some_and(|t| t.is_cancelled()) {
         return Err(ShareSyncError::ScanCancelled("用户取消扫描".into()));
@@ -883,8 +879,8 @@ impl ExclusionRules {
 
     /// 把精确排除路径归一到「相对分享根」命名空间（与快照条目 path 对齐）。
     ///
-    /// 用户挑的可能是分享内绝对路径，也可能是 sharelink 合成路径；不归一时非根分享
-    /// （分享根是某个目录）里排除规则会匹配不到任何条目，表现为「排除没生效」。
+    /// 用户挑的可能是分享内绝对路径或 sharelink 合成路径；不归一时非根分享
+    /// （分享根是某个目录）的排除规则匹配不到任何条目。
     fn remap_exact_paths(&mut self, share_root: &str) {
         if self.exact_paths.is_empty() {
             return;
@@ -1234,8 +1230,7 @@ fn absorb_entries(
         if inserted && !is_dir {
             *files_seen += 1;
         }
-        // 被排除的目录**不入队**：它的内容永远不会被列举（根目录入队、网络吸收、
-        // 缓存吸收三条路径都走这里）。
+        // 被排除的目录不入队，其内容永远不会被列举（根入队与网络/缓存吸收共用此路径）。
         if is_dir
             && dir_allowed_with(include_paths, include_index, exclusions, &normalized_path)
             && queued_dirs.insert(raw_path.clone())

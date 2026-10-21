@@ -169,7 +169,6 @@ const folderChildren = ref<Map<number, number[]>>(new Map())
 // - 进入过的文件夹：看子文件是否全选
 function isFolderChecked(file: SharedFileInfo): boolean {
   if (!file.is_dir) return checkedFsIds.value.has(file.fs_id)
-  // 仅选文件夹模式下不折叠成子文件：文件夹的选中状态只看它自己
   if (props.folderOnly) return checkedFsIds.value.has(file.fs_id)
   const children = folderChildren.value.get(file.fs_id)
   if (!children || children.length === 0) {
@@ -192,7 +191,6 @@ function isFolderIndeterminate(file: SharedFileInfo): boolean {
 
 // 当前目录的全选状态（考虑文件夹的展开状态）
 const isAllCurrentSelected = computed(() => {
-  // 仅选文件夹模式下文件不可选，只看文件夹
   const targets = props.folderOnly
     ? currentFiles.value.filter(f => f.is_dir)
     : currentFiles.value
@@ -238,8 +236,7 @@ watch(() => props.files, (newFiles) => {
 
   for (const f of newFiles) {
     allKnownFiles.value.set(f.fs_id, f)
-    // 仅选文件夹模式默认**不勾选**：排除目录必须逐个确认，
-    // 否则「打开即全选」会让用户一不小心把整个分享根都排掉。
+    // 排除目录必须逐个确认：仅选文件夹模式不默认勾选。
     if (props.folderOnly) continue
     checkedFsIds.value.add(f.fs_id)
   }
@@ -250,8 +247,7 @@ watch(() => props.files, (newFiles) => {
 function handleSelectAllCurrent(val: boolean | string | number) {
   const newSet = new Set(checkedFsIds.value)
   for (const file of currentFiles.value) {
-    // 仅选文件夹模式：只操作文件夹自身（哪怕进入过也不能展开成子文件，
-    // 否则会把不可选的文件塞进选中集合）
+    // 仅选文件夹模式只操作文件夹自身，不展开成子文件。
     if (props.folderOnly) {
       if (!file.is_dir) continue
       if (val) {
@@ -289,7 +285,6 @@ function handleSelectAllCurrent(val: boolean | string | number) {
 function handleCheckChange(fsId: number, checked: boolean | string | number, file?: SharedFileInfo) {
   const newSet = new Set(checkedFsIds.value)
 
-  // 仅选文件夹模式：文件不可选；文件夹只操作自身，不联动子文件
   if (props.folderOnly) {
     if (!file?.is_dir) return
     if (checked) {
@@ -341,7 +336,6 @@ function handleItemClick(file: SharedFileInfo) {
   if (file.is_dir && props.shareInfo) {
     navigateIntoDir(file)
   } else {
-    // 仅选文件夹模式下文件不可选，点击不切换
     if (props.folderOnly) return
     // 切换选择
     const newSet = new Set(checkedFsIds.value)
@@ -417,7 +411,6 @@ async function navigateIntoDir(folder: SharedFileInfo) {
     const newSet = new Set(checkedFsIds.value)
     for (const f of response.files) {
       allKnownFiles.value.set(f.fs_id, f)
-      // 仅选文件夹模式下子文件不参与选中，文件夹自身保持选中
       if (props.folderOnly) continue
       if (wasFolderChecked) {
         newSet.add(f.fs_id)
@@ -531,8 +524,7 @@ async function loadMore() {
       const newSet = new Set(checkedFsIds.value)
       for (const f of moreFiles) {
         allKnownFiles.value.set(f.fs_id, f)
-        // 仅选文件夹模式：翻页**不自动勾选**任何东西（文件不可选，
-        // 目录也必须由用户逐个确认）——否则用户没点过的目录会变成排除项。
+        // 翻页不自动勾选：未经点击的目录不得成为排除项。
         if (props.folderOnly) continue
         if (!checkedFsIds.value.has(f.fs_id)) {
           newSet.add(f.fs_id)
@@ -590,7 +582,6 @@ function emitSelection() {
   const result: number[] = []
 
   if (props.folderOnly) {
-    // 只发显式勾选过的目录：用户勾了哪个就发哪个，绝不提升为父目录
     for (const fsId of checkedFsIds.value) {
       const file = allKnownFiles.value.get(fsId)
       if (file && !file.is_dir) continue

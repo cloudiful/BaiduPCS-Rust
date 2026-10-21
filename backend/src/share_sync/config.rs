@@ -189,8 +189,7 @@ pub struct ShareSubscription {
     /// 排除 glob 模式列表
     #[serde(default)]
     pub exclude_patterns: Vec<String>,
-    /// 精确排除的目录路径列表（相对分享根）。命中的目录连同其中全部内容一起排除，
-    /// 且扫描时不再列举该目录。与 `exclude_patterns` 的 glob 规则互不影响。
+    /// 精确排除的目录路径（相对分享根）：连同全部内容排除，且不再递归列举。
     #[serde(default)]
     pub exclude_paths: Vec<String>,
     /// 同步目标（至少 1 个）
@@ -453,7 +452,7 @@ pub struct CreateShareSubscriptionRequest {
     pub include_paths: Vec<String>,
     #[serde(default)]
     pub exclude_patterns: Vec<String>,
-    /// 精确排除的目录路径（相对分享根）。缺省为空 = 不排除任何目录。
+    /// 精确排除的目录路径（相对分享根）；缺省为空 = 不排除。
     #[serde(default)]
     pub exclude_paths: Vec<String>,
     pub targets: Vec<SyncTarget>,
@@ -940,8 +939,7 @@ mod tests {
         assert_eq!(sub.exclude_paths, vec!["/a/tmp".to_string()]);
     }
 
-    /// 老订阅（没有 exclude_paths 字段）必须能正常反序列化 —— 精确目录排除是新增能力，
-    /// 不能让历史配置读不出来。
+    /// 老订阅没有 exclude_paths 字段，必须仍能反序列化。
     #[test]
     fn test_subscription_without_exclude_paths_deserializes() {
         let json = r#"{
@@ -960,7 +958,7 @@ mod tests {
         assert_eq!(sub.exclude_patterns, vec!["*.tmp".to_string()]);
     }
 
-    /// 精确目录排除随订阅一起序列化往返，编辑后不丢失。
+    /// 精确目录排除随订阅序列化往返，编辑后不丢失。
     #[test]
     fn test_exclude_paths_roundtrip() {
         let mut sub = ShareSubscription::new(
