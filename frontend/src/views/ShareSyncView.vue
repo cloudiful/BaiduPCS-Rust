@@ -63,6 +63,9 @@
                 <template v-if="s.exclude_patterns.length">
                   <span class="dot">·</span><span>排除 {{ s.exclude_patterns.length }} 条</span>
                 </template>
+                <template v-if="s.exclude_paths?.length">
+                  <span class="dot">·</span><span>排除目录 {{ s.exclude_paths.length }} 个</span>
+                </template>
                 <template v-if="s.delete_missing">
                   <span class="dot">·</span><span class="danger-text">删除缺失</span>
                 </template>
@@ -124,6 +127,21 @@
                   <span class="task-status-text">扫描分享目录中…</span>
                 </div>
                 <span class="scan-stat">{{ scanSummary(scanOf(s.id)!) }}</span>
+                <!-- 取消本次扫描：只停扫描，已开始的转存/下载不受影响 -->
+                <el-tooltip content="取消本次扫描" placement="top">
+                  <el-button
+                      class="scan-cancel-btn"
+                      size="small"
+                      text
+                      circle
+                      aria-label="取消本次扫描"
+                      :loading="cancellingId === s.id"
+                      :disabled="cancellingId === s.id"
+                      @click.stop="cancelScanNow(s)"
+                  >
+                    <el-icon><Close /></el-icon>
+                  </el-button>
+                </el-tooltip>
               </div>
               <div class="scan-body">
                 <!-- BFS 边扫边发现新子目录，待扫描数会涨；给百分比会让进度条倒退，
@@ -288,6 +306,19 @@
             </div>
             <span v-else>无</span>
           </el-descriptions-item>
+          <el-descriptions-item label="排除目录">
+            <div v-if="(selected.exclude_paths?.length ?? 0) > 0" class="path-tags">
+              <el-tag
+                  v-for="(p, i) in selected.exclude_paths"
+                  :key="`exp-${i}`"
+                  size="small"
+                  type="warning"
+              >
+                {{ p }}
+              </el-tag>
+            </div>
+            <span v-else>无</span>
+          </el-descriptions-item>
           <el-descriptions-item label="轮询">
             <span v-if="isPollEnabled(selected.poll_config)">
               {{ describeInterval(selected.poll_config) }}
@@ -327,6 +358,7 @@
               :owner-logged-in="selectedOwnerLoggedIn"
               v-model:include-paths="form.include_paths"
               v-model:exclude-patterns="form.exclude_patterns"
+              v-model:exclude-paths="form.exclude_paths"
           />
         </el-form-item>
         <el-form-item label="冲突策略">
@@ -515,7 +547,7 @@ import { FilePickerModal } from '@/components/FilePicker'
 import { getConfig, updateRecentDirDebounced, setDefaultDownloadDir, type DownloadConfig } from '@/api/config'
 import {
   Plus, Edit, Delete, Refresh, RefreshRight, Link,
-  FolderOpened, VideoPause, VideoPlay, Loading, Clock, ArrowDown, ArrowRight,
+  FolderOpened, VideoPause, VideoPlay, Loading, Clock, ArrowDown, ArrowRight, Close,
 } from '@element-plus/icons-vue'
 import {
   type ShareSubscription,
@@ -530,7 +562,7 @@ import {
   type ShareSyncWsEvent,
   type ShareSyncSubtask,
   listSubscriptions, updateSubscription,
-  deleteSubscription, setSubscriptionEnabled, triggerSubscription, resumeSubscription, listRuns, getRun, listRunItems, listSubtasks,
+  deleteSubscription, setSubscriptionEnabled, triggerSubscription, resumeSubscription, cancelScan, listRuns, getRun, listRunItems, listSubtasks,
 } from '@/api/shareSync'
 import { getWebSocketClient, connectWebSocket, type ConnectionState } from '@/utils/websocket'
 import { createAdaptivePoller } from '@/utils/backendHealth'
@@ -663,6 +695,54 @@ function setScanProgress(id: string, st: Omit<ScanProgressState, 'received_at'> 
   scanProgress.value = next
 }
 
+/**
+ * 各订阅当前已知的最新一轮 run_id。
+ *
+ * 迟到的旧事件（旧轮的取消/完成结果）不得抹掉**新一轮**的扫描进度：所有
+ * 「按订阅清理」的动作都先比对 run 身份，再决定要不要清。
+ */
+const latestRunIds = ref<Map<string, string>>(new Map())
+
+function noteLatestRun(subId: string, runId?: string | null) {
+  if (!runId) return
+  const next = new Map(latestRunIds.value)
+  next.set(subId, runId)
+  latestRunIds.value = next
+}
+
+/**
+ * 该事件是否仍对应当前订阅的最新一轮。
+ *
+ * 没见过任何一轮时（页面刚打开）按「是」处理 —— 事件本身就是唯一信息。
+ */
+function isLatestRun(subId: string, runId?: string | null): boolean {
+  const latest = latestRunIds.value.get(subId)
+  if (!latest) return true
+  if (runId && latest !== runId) return false
+  return true
+}
+
+/**
+ * 只在状态仍属于该轮时清理扫描进度。
+ *
+ * 迟到的旧响应 / 旧事件不得抹掉新一轮的扫描进度（否则正在扫描的新一轮会
+ * 突然「消失」，连取消入口都没了）。
+ */
+function clearScanProgressForRun(subId: string, runId?: string | null): boolean {
+  if (!isLatestRun(subId, runId)) return false
+  setScanProgress(subId, null)
+  return true
+}
+
+/** 同上，并连同该订阅的进行中子任务一起清理。 */
+function clearRunStateForRun(subId: string, runId?: string | null): boolean {
+  if (!clearScanProgressForRun(subId, runId)) return false
+  const next = new Map(activeSubtasks.value)
+  next.delete(subId)
+  activeSubtasks.value = next
+  return true
+}
+
 // 后端每 ~500ms 推一帧；超过 20s 没有新帧，说明 run 早已结束或断连，
 // 而结束事件没送达（WS 掉线等）。留着会让卡片永远转圈，比没有进度更误导。
 const SCAN_STALE_MS = 20_000
@@ -764,6 +844,8 @@ const detailDialogVisible = ref(false)
 const saving = ref(false)
 const triggeringId = ref<string | null>(null)
 const resumingId = ref<string | null>(null)
+// 正在取消扫描的订阅：用于禁用重复点击
+const cancellingId = ref<string | null>(null)
 const formRef = ref()
 const scheduledTime = ref<string>('03:00')
 
@@ -863,6 +945,7 @@ const defaultForm = (): {
   password: string
   include_paths: string[]
   exclude_patterns: string[]
+  exclude_paths: string[]
   targets: SyncTarget[]
   conflict_strategy: ConflictStrategy
   delete_missing: boolean
@@ -873,6 +956,7 @@ const defaultForm = (): {
   password: '',
   include_paths: [],
   exclude_patterns: [],
+  exclude_paths: [],
   targets: [createDefaultTarget()],
   conflict_strategy: 'overwrite',
   delete_missing: false,
@@ -1030,6 +1114,7 @@ function openEdit(s?: ShareSubscription) {
     password: selected.value.password || '',
     include_paths: [...selected.value.include_paths],
     exclude_patterns: [...selected.value.exclude_patterns],
+    exclude_paths: [...(selected.value.exclude_paths ?? [])],
     targets: selected.value.targets.map(t => ({ ...t })) as SyncTarget[],
     conflict_strategy: selected.value.conflict_strategy,
     delete_missing: selected.value.delete_missing,
@@ -1081,6 +1166,7 @@ async function saveForm() {
         password: form.value.password || null,
         include_paths: form.value.include_paths,
         exclude_patterns: form.value.exclude_patterns,
+        exclude_paths: form.value.exclude_paths,
         targets: form.value.targets,
         conflict_strategy: form.value.conflict_strategy,
         delete_missing: form.value.delete_missing,
@@ -1207,8 +1293,16 @@ function buildSanitizedPayload() {
       excludeSet.add(n)
     }
   }
+  const excludePathSet = new Set<string>()
+  for (const p of form.value.exclude_paths) {
+    const n = normalizePath(p)
+    if (n) {
+      excludePathSet.add(n)
+    }
+  }
   form.value.include_paths = Array.from(includeSet)
   form.value.exclude_patterns = Array.from(excludeSet)
+  form.value.exclude_paths = Array.from(excludePathSet)
 
   const nextTargets: SyncTarget[] = []
   for (const raw of form.value.targets) {
@@ -1316,6 +1410,35 @@ async function triggerNow(s?: ShareSubscription) {
     ElMessage.error(`触发失败: ${getApiErrorMessage(e)}`)
   } finally {
     triggeringId.value = null
+  }
+}
+
+/**
+ * 取消当前正在进行的扫描。
+ *
+ * 只停扫描：订阅仍保持启用，已开始的转存/下载不受影响。
+ * 后端在「已进入执行阶段」时会返回 409 —— 此时如实提示，不假装取消成功。
+ *
+ * 取消请求带上用户观察到的那一轮 run_id：迟到的旧请求既不会被后端执行，
+ * 迟到的旧响应也不会抹掉新一轮的扫描进度。
+ */
+async function cancelScanNow(s?: ShareSubscription) {
+  const target = s ?? selected.value
+  if (!target) return
+  const scan = scanOf(target.id)
+  if (!scan) return
+  if (cancellingId.value) return
+  cancellingId.value = target.id
+  try {
+    await cancelScan(target.id, scan.run_id)
+    // 只清理这一轮的状态（REST 路径）；WS 事件到达时再清一次是幂等的
+    clearRunStateForRun(target.id, scan.run_id)
+    ElMessage.success('已取消本次扫描')
+    if (selected.value?.id === target.id) loadRuns(target.id)
+  } catch (e) {
+    ElMessage.error(`取消扫描失败: ${getApiErrorMessage(e)}`)
+  } finally {
+    cancellingId.value = null
   }
 }
 
@@ -1454,7 +1577,8 @@ function describeRunStatus(s: string, phase?: string | null): string {
       s === 'completed' ? '已完成' :
           s === 'completed_with_errors' ? '完成（部分失败）' :
               s === 'failed' ? '失败' :
-                  s === 'interrupted' ? '已中断（自动重跑）' : s
+                  s === 'cancelled' ? '已取消' :
+                      s === 'interrupted' ? '已中断（自动重跑）' : s
 }
 
 function runStatusType(s: string): 'success' | 'warning' | 'danger' | 'info' {
@@ -1785,6 +1909,7 @@ onMounted(async () => {
       return
     }
     if (evt.type === 'scan_progress') {
+      noteLatestRun(sid, evt.run_id)
       setScanProgress(sid, {
         run_id: evt.run_id,
         dirs_done: evt.dirs_done,
@@ -1802,22 +1927,27 @@ onMounted(async () => {
     }
     if (evt.type === 'run_started') {
       // 新一轮开始：清掉旧的进度残留，随后由 item_progress / 轮询补齐
+      noteLatestRun(sid, evt.run_id)
       loadSubtasksFor(sid)
       setScanProgress(sid, null)
     }
     if (evt.type === 'diff_detected') {
-      // 抓取阶段结束，进入执行段：撤掉扫描卡片，让位给子任务进度
-      setScanProgress(sid, null)
+      // 抓取阶段结束，进入执行段：撤掉扫描卡片，让位给子任务进度。
+      // 旧轮的 diff 事件不得撤掉新一轮的扫描卡片。
+      clearScanProgressForRun(sid, evt.run_id)
     }
-    if (['run_completed', 'run_failed'].includes(evt.type)) {
-      // 一轮结束：清空该订阅的进行中子任务与扫描进度
-      const next = new Map(activeSubtasks.value)
-      next.delete(sid)
-      activeSubtasks.value = next
-      setScanProgress(sid, null)
+    if (evt.type === 'run_completed' || evt.type === 'run_failed') {
+      // 一轮结束：清空该订阅的进行中子任务与扫描进度。
+      // 只清理仍属于这一轮的状态：迟到的旧完成事件不得抹掉新一轮的进度。
+      clearRunStateForRun(sid, evt.run_id)
+    }
+    if (evt.type === 'run_cancelled') {
+      // 一轮被取消：同样清掉扫描卡片与子任务（取消只停扫描，不影响订阅本身）。
+      // 旧轮的取消事件不得抹掉新一轮的扫描进度。
+      clearRunStateForRun(sid, evt.run_id)
     }
     if (sid === selected.value?.id) {
-      if (['run_started', 'run_completed', 'run_failed', 'diff_detected'].includes(evt.type)) {
+      if (['run_started', 'run_completed', 'run_failed', 'run_cancelled', 'diff_detected'].includes(evt.type)) {
         loadRuns(sid)
       }
       // run_completed 不再弹提示（结果可在运行历史里看）；仅失败时提醒。
@@ -2073,6 +2203,15 @@ onUnmounted(() => {
   margin-top: 4px;
   font-size: 12px;
   color: #e6a23c;
+}
+// 取消扫描按钮：贴在扫描统计右侧，弱化但可点
+.scan-cancel-btn {
+  margin-left: 4px;
+  flex-shrink: 0;
+  color: #909399;
+}
+.scan-cancel-btn:hover {
+  color: var(--el-color-danger);
 }
 
 .no-active-task {

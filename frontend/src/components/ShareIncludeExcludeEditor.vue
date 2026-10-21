@@ -39,6 +39,43 @@
       </div>
     </div>
 
+    <!-- 排除目录（exclude_paths）：精确目录排除 -->
+    <div class="field-block">
+      <div class="field-label">排除目录</div>
+      <div class="path-editor">
+        <div class="path-tags">
+          <el-tag
+              v-for="(p, i) in excludePaths"
+              :key="p + i"
+              closable
+              type="warning"
+              @close="removeExcludePath(i)"
+              style="margin: 2px 4px 2px 0"
+          >{{ p }}</el-tag>
+          <span v-if="excludePaths.length === 0" class="path-empty-inline">
+            选中的目录连同其中全部内容都不会同步
+          </span>
+        </div>
+        <div class="path-actions">
+          <el-tooltip
+              :disabled="ownerLoggedIn !== false"
+              content="订阅所属账号未登录，请先登录该账号再预览目录树"
+              placement="top"
+          >
+            <span>
+              <el-button
+                  size="small"
+                  :icon="FolderOpened"
+                  :loading="previewing"
+                  :disabled="!shareUrl || ownerLoggedIn === false"
+                  @click="openExcludePicker"
+              >从分享浏览</el-button>
+            </span>
+          </el-tooltip>
+        </div>
+      </div>
+    </div>
+
     <!-- 排除规则（exclude_patterns） -->
     <div class="field-block">
       <div class="field-label">排除规则</div>
@@ -119,7 +156,7 @@
     <!-- 从分享选择子路径：复用转存同款 ShareFileSelector -->
     <el-dialog
         v-model="pickerVisible"
-        title="从分享中选择要同步的子路径"
+        :title="pickerMode === 'exclude' ? '从分享中选择要排除的目录' : '从分享中选择要同步的子路径'"
         width="680px"
         :close-on-click-modal="false"
         append-to-body
@@ -130,6 +167,7 @@
           :share-info="previewShareInfo"
           :share-url="shareUrl"
           :share-password="password || undefined"
+          :folder-only="pickerMode === 'exclude'"
           @update:selected-files="onSelectedFiles"
       />
       <template #footer>
@@ -162,6 +200,8 @@ const props = defineProps<{
   password?: string | null
   includePaths: string[]
   excludePatterns: string[]
+  /** 精确排除的目录路径（相对分享根） */
+  excludePaths: string[]
   // 订阅所属账号：编辑订阅时传订阅自己的 owner_uid，预览目录树按该账号路由 client
   // （不传则后端回退当前 active 账号——转存对话框创建场景 owner=active）
   ownerUid?: number | null
@@ -173,6 +213,7 @@ const props = defineProps<{
 const emit = defineEmits<{
   'update:includePaths': [value: string[]]
   'update:excludePatterns': [value: string[]]
+  'update:excludePaths': [value: string[]]
 }>()
 
 const router = useRouter()
@@ -180,6 +221,8 @@ const excludeInput = ref('')
 
 // 分享文件选择器（与转存对话框同款体验）
 const pickerVisible = ref(false)
+// 选择器用途：同步子路径 / 排除目录（后者只允许选文件夹）
+const pickerMode = ref<'include' | 'exclude'>('include')
 const previewing = ref(false)
 const previewFiles = ref<SharedFileInfo[]>([])
 const previewShareInfo = ref<PreviewShareInfo | null>(null)
@@ -197,6 +240,12 @@ function removeInclude(i: number) {
   const next = [...props.includePaths]
   next.splice(i, 1)
   emit('update:includePaths', next)
+}
+
+function removeExcludePath(i: number) {
+  const next = [...props.excludePaths]
+  next.splice(i, 1)
+  emit('update:excludePaths', next)
 }
 
 // 排除规则使用说明的展开态
@@ -284,15 +333,7 @@ function removeExclude(i: number) {
   emit('update:excludePatterns', next)
 }
 
-async function openPicker() {
-  if (!props.shareUrl || !props.shareUrl.trim()) {
-    ElMessage.warning('请先填写分享链接')
-    return
-  }
-  if (props.ownerLoggedIn === false) {
-    ElMessage.warning('订阅所属账号未登录，请先登录该账号再预览目录树')
-    return
-  }
+async function loadPickerFiles() {
   previewing.value = true
   try {
     const resp = await previewShareFiles({
@@ -316,6 +357,32 @@ async function openPicker() {
   }
 }
 
+async function openPicker() {
+  if (!props.shareUrl || !props.shareUrl.trim()) {
+    ElMessage.warning('请先填写分享链接')
+    return
+  }
+  if (props.ownerLoggedIn === false) {
+    ElMessage.warning('订阅所属账号未登录，请先登录该账号再预览目录树')
+    return
+  }
+  pickerMode.value = 'include'
+  await loadPickerFiles()
+}
+
+async function openExcludePicker() {
+  if (!props.shareUrl || !props.shareUrl.trim()) {
+    ElMessage.warning('请先填写分享链接')
+    return
+  }
+  if (props.ownerLoggedIn === false) {
+    ElMessage.warning('订阅所属账号未登录，请先登录该账号再预览目录树')
+    return
+  }
+  pickerMode.value = 'exclude'
+  await loadPickerFiles()
+}
+
 function onSelectedFiles(files: SharedFileInfo[]) {
   pendingSelected.value = files
 }
@@ -324,6 +391,22 @@ function confirmPicker() {
   const selectedPaths = pendingSelected.value
       .map((f) => normalizePath(f.path))
       .filter((p) => p.length > 0)
+  if (pickerMode.value === 'exclude') {
+    // 精确排除：合并去重；祖先目录已覆盖的后代不必单独保留
+    const merged: string[] = []
+    const seen = new Set<string>()
+    for (const p of [...props.excludePaths, ...selectedPaths]) {
+      if (seen.has(p)) continue
+      seen.add(p)
+      merged.push(p)
+    }
+    const trimmed = merged.filter(
+        (p) => !merged.some((a) => a !== p && p.startsWith(`${a}/`)),
+    )
+    emit('update:excludePaths', trimmed)
+    pickerVisible.value = false
+    return
+  }
   // 与已有路径合并去重；勾选目录即代表整棵子树，裁剪掉被祖先覆盖的冗余后代
   const merged: string[] = []
   const seen = new Set<string>()
