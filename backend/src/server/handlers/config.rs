@@ -174,6 +174,7 @@ pub async fn reset_to_recommended(
             .update_max_concurrent_tasks(eff_up_concurrent)
             .await;
         upload_manager.update_max_retries(eff_up_retries);
+        upload_manager.update_skip_rapid_upload(config.upload.skip_rapid_upload);
         info!(
             "✓ 上传管理器已更新为推荐配置 (uid={}): 线程数={}, 最大任务数={}, 最大重试={}",
             uid.raw(),
@@ -263,6 +264,13 @@ pub async fn update_config(
         new_config.web_auth = guard.web_auth.clone();
 
         preserve_missing_regex_presets(&raw, &mut new_config, &guard.share_sync);
+        // 旧版前端提交的整份配置不含 notification 段：保留服务端当前值，避免被默认值覆盖
+        if raw.get("notification").is_none() {
+            new_config.notification = guard.notification.clone();
+        }
+        if let Err(e) = new_config.notification.validate() {
+            return Err(ApiError::BadRequest(format!("消息通知配置校验失败: {}", e)));
+        }
         if let Err(e) = new_config.share_sync.validate() {
             return Err(ApiError::BadRequest(format!(
                 "分享同步排除规则校验失败: {}",
@@ -278,6 +286,7 @@ pub async fn update_config(
 
         // 更新内存中的配置
         *guard = new_config.clone();
+        crate::notification::apply_config(&new_config.notification);
         (validation_result, proxy_changed)
     };
 
@@ -368,6 +377,7 @@ pub async fn update_config(
                     .update_max_concurrent_tasks(eff_up_concurrent)
                     .await;
                 upload_manager.update_max_retries(eff_up_retries);
+                upload_manager.update_skip_rapid_upload(new_config.upload.skip_rapid_upload);
                 info!(
                     "✓ 上传管理器配置已动态更新 (uid={}): 线程数={}, 最大任务数={}, 最大重试={}",
                     uid.raw(),
@@ -971,6 +981,99 @@ pub async fn get_proxy_status(
         status,
         flap_count,
         next_probe_in_secs,
+    })))
+}
+
+/// GET /api/v1/config/notification
+/// 获取消息通知配置
+pub async fn get_notification_config(
+    State(app_state): State<crate::server::AppState>,
+) -> ApiResult<Json<ApiResponse<crate::notification::NotificationConfig>>> {
+    let cfg = app_state.config.read().await.notification.clone();
+    Ok(Json(ApiResponse::success(cfg)))
+}
+
+/// PUT /api/v1/config/notification
+/// 更新消息通知配置（只改 notification 段，立即热生效）
+pub async fn update_notification_config(
+    State(app_state): State<crate::server::AppState>,
+    Json(req): Json<crate::notification::NotificationConfig>,
+) -> ApiResult<Json<ApiResponse<crate::notification::NotificationConfig>>> {
+    // 注意：不打印请求体（含 Gotify Token / Webhook 请求头等敏感信息）
+    info!(
+        "更新消息通知配置: enabled={}, webhook={}, gotify={}",
+        req.enabled, req.webhook.enabled, req.gotify.enabled
+    );
+    req.validate()
+        .map_err(|e| ApiError::BadRequest(format!("消息通知配置校验失败: {}", e)))?;
+
+    // 持写锁完成「改 → 落盘 → 回写内存」，避免与其他保存交错丢更新
+    {
+        let mut guard = app_state.config.write().await;
+        let mut config = guard.clone();
+        config.notification = req.clone();
+        config
+            .save_to_file(APP_CONFIG_PATH)
+            .await
+            .map_err(ApiError::Internal)?;
+        *guard = config;
+        crate::notification::apply_config(&req);
+    }
+
+    Ok(Json(ApiResponse::success(req)))
+}
+
+/// 发送测试通知请求（请求体可为 `{}`）
+#[derive(Debug, Default, Deserialize)]
+pub struct NotificationTestRequest {
+    /// 待测试的配置（设置页未保存的草稿）；缺省时使用已保存配置
+    #[serde(default)]
+    pub config: Option<crate::notification::NotificationConfig>,
+}
+
+/// 发送测试通知响应
+#[derive(Debug, Serialize)]
+pub struct NotificationTestResponse {
+    /// 所有已启用渠道均发送成功
+    pub success: bool,
+    pub results: Vec<crate::notification::ChannelSendResult>,
+}
+
+/// POST /api/v1/config/notification/test
+/// 发送测试通知：同步等待各渠道结果；只看渠道开关，不受总开关 / 事件开关影响。
+/// 纯无副作用：不修改已保存配置。
+pub async fn test_notification(
+    State(app_state): State<crate::server::AppState>,
+    Json(req): Json<NotificationTestRequest>,
+) -> ApiResult<Json<ApiResponse<NotificationTestResponse>>> {
+    let cfg = match req.config {
+        Some(cfg) => cfg,
+        None => app_state.config.read().await.notification.clone(),
+    };
+    if !cfg.has_active_channel() {
+        return Err(ApiError::BadRequest(
+            "请至少启用一个通知渠道（Webhook 或 Gotify）".to_string(),
+        ));
+    }
+    cfg.validate()
+        .map_err(|e| ApiError::BadRequest(format!("消息通知配置校验失败: {}", e)))?;
+
+    let results = crate::notification::send_test(&cfg).await;
+    let success = !results.is_empty() && results.iter().all(|r| r.success);
+    for r in &results {
+        if r.success {
+            info!("测试通知发送成功: {}", r.channel);
+        } else {
+            warn!(
+                "测试通知发送失败: {}: {}",
+                r.channel,
+                r.error.as_deref().unwrap_or("unknown")
+            );
+        }
+    }
+    Ok(Json(ApiResponse::success(NotificationTestResponse {
+        success,
+        results,
     })))
 }
 

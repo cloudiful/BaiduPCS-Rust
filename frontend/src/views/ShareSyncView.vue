@@ -54,7 +54,7 @@
                 <el-tag :type="strategyTagType(s.conflict_strategy)" size="small">{{ describeStrategy(s.conflict_strategy) }}</el-tag>
               </div>
               <div class="config-path">
-                <span>{{ describeTargets(s.targets) }}</span>
+                <span>{{ describeTargets(s.targets, s.owner_uid) }}</span>
                 <span class="dot">·</span>
                 <span>{{ describeInterval(s.poll_config) }}</span>
                 <template v-if="s.include_paths.length">
@@ -67,7 +67,7 @@
                   <span class="dot">·</span><span>排除正则 {{ s.exclude_regex_patterns!.length }} 条</span>
                 </template>
                 <template v-if="s.exclude_paths?.length">
-                  <span class="dot">·</span><span>排除目录 {{ s.exclude_paths.length }} 个</span>
+                  <span class="dot">·</span><span>排除内容 {{ s.exclude_paths.length }} 项</span>
                 </template>
                 <template v-if="s.delete_missing">
                   <span class="dot">·</span><span class="danger-text">删除缺失</span>
@@ -321,7 +321,7 @@
             </div>
             <span v-else>无</span>
           </el-descriptions-item>
-          <el-descriptions-item label="排除目录">
+          <el-descriptions-item label="排除内容">
             <div v-if="(selected.exclude_paths?.length ?? 0) > 0" class="path-tags">
               <el-tag
                   v-for="(p, i) in selected.exclude_paths"
@@ -403,6 +403,54 @@
                 />
               </div>
             </div>
+            <div v-if="showTargetAccountControls && netdiskEnabled" class="target-account-row">
+              <span class="target-account-label">网盘账号</span>
+              <AccountSelect
+                  v-model="primaryNetdiskAccount"
+                  size="small"
+                  class="target-account-select"
+                  aria-label="网盘目标账号"
+              />
+            </div>
+
+            <!-- 多账号归集：同一订阅额外转存到其他账号的网盘（每个账号最多 1 个网盘目标） -->
+            <!-- 归集目标是「额外」的网盘目标：跟随「转存到网盘」开关，关闭时隐藏且不提交 -->
+            <div
+                v-for="(et, idx) in visibleExtraNetdiskTargets"
+                :key="`extra-${idx}`"
+                class="target-row extra-netdisk-row"
+            >
+              <div class="target-switch">
+                <AccountSelect
+                    :model-value="et.account_uid ?? editingOwnerUid()"
+                    @update:model-value="et.account_uid = $event"
+                    size="small"
+                    class="target-account-select"
+                    :aria-label="`归集账号 #${idx + 1}`"
+                    placeholder="选择账号"
+                />
+              </div>
+              <div class="target-path">
+                <el-input
+                    v-model="et.remote_path"
+                    :aria-label="`归集网盘目录 #${idx + 1}`"
+                    placeholder="该账号网盘路径，如 /我的资源/同步"
+                >
+                  <template #append>
+                    <el-button
+                        :icon="Close"
+                        :aria-label="`移除归集目标 #${idx + 1}`"
+                        @click="removeExtraNetdiskTarget(idx)"
+                    />
+                  </template>
+                </el-input>
+              </div>
+            </div>
+            <div v-if="authStore.hasMultipleAccounts && netdiskEnabled" class="target-account-row">
+              <el-button size="small" text type="primary" :icon="Plus" @click="addExtraNetdiskTarget">
+                同时转存到其他账号的网盘
+              </el-button>
+            </div>
 
             <div class="target-row">
               <div class="target-switch">
@@ -430,6 +478,25 @@
                 </el-input>
               </div>
             </div>
+            <div v-if="showTargetAccountControls && localEnabled" class="target-account-row">
+              <span class="target-account-label">下载账号</span>
+              <el-select
+                  v-model="localDownloadAccount"
+                  size="small"
+                  class="target-account-select"
+                  aria-label="本地下载账号"
+              >
+                <el-option value="owner" label="跟随订阅所属账号" />
+                <el-option value="default" :label="defaultDownloadAccountLabel" />
+                <el-option
+                    v-for="acc in authStore.accounts"
+                    :key="acc.uid"
+                    :value="acc.uid"
+                    :label="`${acc.nickname || acc.username}（UID: ${acc.uid}）`"
+                />
+              </el-select>
+            </div>
+            <div v-if="crossAccountHint" class="sync-mode-hint">{{ crossAccountHint }}</div>
 
             <div v-if="syncModeHint" class="sync-mode-hint">{{ syncModeHint }}</div>
           </div>
@@ -487,16 +554,73 @@
           <el-descriptions-item label="覆盖">{{ runOverwrittenCount(currentRun) }}</el-descriptions-item>
           <el-descriptions-item label="一致跳过">{{ runUnchangedCount(currentRun) }}</el-descriptions-item>
           <el-descriptions-item label="其它跳过">{{ runSkippedCount(currentRun) }}</el-descriptions-item>
-          <el-descriptions-item label="失败">{{ currentRun.failed_count }}</el-descriptions-item>
+          <el-descriptions-item label="失败">
+            <el-link
+                v-if="currentRun.failed_count > 0"
+                type="danger"
+                class="run-failed-link"
+                @click="filterRunItemsByStatus('failed')"
+            >{{ currentRun.failed_count }}（只看失败）</el-link>
+            <template v-else>{{ currentRun.failed_count }}</template>
+          </el-descriptions-item>
           <el-descriptions-item label="错误" v-if="currentRun.error">
             <span style="color: #f56c6c">{{ currentRun.error }}</span>
           </el-descriptions-item>
         </el-descriptions>
-        <h4 style="margin-top: 16px">文件动作（{{ currentRun.item_total_count }}）</h4>
-        <el-table :data="currentRun.items" size="small" max-height="400" v-loading="runItemsLoading">
+        <div class="run-items-header">
+          <h4>文件动作（{{ runItemsHeaderCount }}）</h4>
+          <!-- 服务端筛选：total / 分页都按筛选后的结果算，几千条里也能直接定位失败项 -->
+          <div class="run-items-filters">
+            <el-select
+                v-model="runItemFilter.status"
+                size="small"
+                class="run-item-status-filter"
+                aria-label="按状态筛选"
+                @change="applyRunItemFilter"
+            >
+              <el-option
+                  v-for="opt in runItemStatusOptions"
+                  :key="opt.value"
+                  :label="opt.label"
+                  :value="opt.value"
+              />
+            </el-select>
+            <el-select
+                v-model="runItemFilter.action"
+                size="small"
+                class="run-item-action-filter"
+                aria-label="按动作筛选"
+                @change="applyRunItemFilter"
+            >
+              <el-option
+                  v-for="opt in runItemActionOptions"
+                  :key="opt.value"
+                  :label="opt.label"
+                  :value="opt.value"
+              />
+            </el-select>
+            <el-input
+                v-model="runItemFilter.q"
+                size="small"
+                clearable
+                placeholder="搜索路径"
+                class="run-item-keyword-filter"
+                @input="onRunItemKeywordInput"
+                @clear="applyRunItemFilter"
+                @keyup.enter="applyRunItemFilter"
+            />
+          </div>
+        </div>
+        <el-table
+            :data="currentRun.items"
+            size="small"
+            max-height="400"
+            v-loading="runItemsLoading"
+            :empty-text="runItemFilterActive ? '没有符合筛选条件的文件' : '暂无数据'"
+        >
           <el-table-column prop="path" label="路径" />
           <el-table-column prop="action" label="动作" width="80" :formatter="describeAction" />
-          <el-table-column prop="target" label="目标" width="80" :formatter="describeTarget" />
+          <el-table-column prop="target" label="目标" width="120" :formatter="describeTarget" />
           <el-table-column prop="status" label="状态" width="100" :formatter="describeItemStatus" />
           <el-table-column prop="reason" label="跳过原因" width="120" :formatter="describeReason" />
           <el-table-column prop="error" label="错误" />
@@ -563,13 +687,14 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
+import { ref, reactive, computed, onMounted, onUnmounted, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import type { AxiosError } from 'axios'
 import { useAuthStore } from '@/stores/auth'
 import { useIsMobile } from '@/utils/responsive'
 import AccountFilter from '@/components/AccountFilter.vue'
 import AccountBadge from '@/components/AccountBadge.vue'
+import AccountSelect from '@/components/AccountSelect.vue'
 import TransferDialog from '@/components/TransferDialog.vue'
 import ShareIncludeExcludeEditor from '@/components/ShareIncludeExcludeEditor.vue'
 import CronExprEditor from '@/components/CronExprEditor.vue'
@@ -631,6 +756,119 @@ const runs = ref<RunRecord[]>([])
 const currentRun = ref<RunDetail | null>(null)
 const currentRunId = ref<string | null>(null)
 const runItemsLoading = ref(false)
+
+// ---- 运行详情「文件动作」服务端筛选 ----
+const runItemFilter = reactive({ status: 'all', action: 'all', q: '' })
+// 请求版本号：切筛选 / 翻页 / 换 run 时丢弃旧回包，避免慢请求覆盖新结果
+let runItemsRequestVersion = 0
+let runItemKeywordTimer: ReturnType<typeof setTimeout> | null = null
+const RUN_ITEM_IN_PROGRESS_STATUSES = ['pending', 'transferring', 'downloading', 'deleting']
+
+const runItemFilterActive = computed(
+    () => runItemFilter.status !== 'all' || runItemFilter.action !== 'all' || runItemFilter.q.trim() !== '',
+)
+
+/** 整个 run 的明细条数：优先用分组计数（不受筛选影响），老后端回退到 item_total_count */
+const runItemsAllCount = computed(() => {
+  const run = currentRun.value
+  if (!run) return 0
+  const counts = run.item_facets?.status_counts
+  if (counts) return Object.values(counts).reduce((a, b) => a + b, 0)
+  return run.item_total_count
+})
+
+const runItemsHeaderCount = computed(() => {
+  const run = currentRun.value
+  if (!run) return ''
+  return runItemFilterActive.value
+      ? `筛选出 ${run.item_total_count} / 共 ${runItemsAllCount.value}`
+      : `${run.item_total_count}`
+})
+
+function withCount(label: string, n: number | undefined): string {
+  return n === undefined ? label : `${label}（${n}）`
+}
+
+const runItemStatusOptions = computed(() => {
+  const counts = currentRun.value?.item_facets?.status_counts
+  const pick = (k: string) => (counts ? counts[k] ?? 0 : undefined)
+  const inProgress = counts
+      ? RUN_ITEM_IN_PROGRESS_STATUSES.reduce((a, k) => a + (counts[k] ?? 0), 0)
+      : undefined
+  return [
+    { value: 'all', label: withCount('全部状态', counts ? runItemsAllCount.value : undefined) },
+    { value: 'failed', label: withCount('失败', pick('failed')) },
+    { value: 'completed', label: withCount('完成', pick('completed')) },
+    { value: 'skipped', label: withCount('跳过', pick('skipped')) },
+    { value: 'in_progress', label: withCount('进行中', inProgress) },
+  ]
+})
+
+const runItemActionOptions = computed(() => {
+  const counts = currentRun.value?.item_facets?.action_counts
+  const pick = (k: string) => (counts ? counts[k] ?? 0 : undefined)
+  return [
+    { value: 'all', label: withCount('全部动作', counts ? runItemsAllCount.value : undefined) },
+    ...['added', 'modified', 'removed', 'skipped'].map((k) => ({
+      value: k,
+      label: withCount(ACTION_LABELS[k] ?? k, pick(k)),
+    })),
+  ]
+})
+
+function clearRunItemKeywordTimer() {
+  if (runItemKeywordTimer) {
+    clearTimeout(runItemKeywordTimer)
+    runItemKeywordTimer = null
+  }
+}
+
+function resetRunItemFilter() {
+  clearRunItemKeywordTimer()
+  runItemFilter.status = 'all'
+  runItemFilter.action = 'all'
+  runItemFilter.q = ''
+}
+
+async function loadRunItems(page: number) {
+  if (!currentRunId.value || !currentRun.value) return
+  const runId = currentRunId.value
+  const version = ++runItemsRequestVersion
+  runItemsLoading.value = true
+  try {
+    const res = await listRunItems(runId, page, currentRun.value.item_page_size, { ...runItemFilter })
+    if (version !== runItemsRequestVersion || currentRunId.value !== runId || !currentRun.value) return
+    currentRun.value.items = res.items
+    currentRun.value.item_page = res.page
+    currentRun.value.item_total_count = res.total
+    if (res.facets) currentRun.value.item_facets = res.facets
+  } catch (e) {
+    if (version === runItemsRequestVersion) {
+      ElMessage.error(`加载运行明细失败: ${getApiErrorMessage(e)}`)
+    }
+  } finally {
+    if (version === runItemsRequestVersion) runItemsLoading.value = false
+  }
+}
+
+/** 筛选条件变化：回到第 1 页重新查询 */
+function applyRunItemFilter() {
+  clearRunItemKeywordTimer()
+  void loadRunItems(1)
+}
+
+function onRunItemKeywordInput() {
+  clearRunItemKeywordTimer()
+  runItemKeywordTimer = setTimeout(() => {
+    runItemKeywordTimer = null
+    void loadRunItems(1)
+  }, 300)
+}
+
+function filterRunItemsByStatus(status: string) {
+  runItemFilter.status = status
+  applyRunItemFilter()
+}
 
 // 进行中子任务：subscription_id -> 子任务列表（WS item_progress 实时更新 + REST 轮询兜底）
 const activeSubtasks = ref<Map<string, ShareSyncSubtask[]>>(new Map())
@@ -891,6 +1129,8 @@ function targetKindCounts(): { netdisk: number; local: number } {
 //   网盘+本地     = Netdisk + Local{ mode: transfer_and_download }（后端合并成一条腿：转存一次→从副本下载）
 //   仅本地        = 仅 Local{ mode: share_direct }（分享直下：转临时目录→下载→清理，网盘不留存）
 // 约束：至少开启一个。
+// 跨账号（#179）时后端按账号分腿推导：本地下载账号上没有网盘目标时，该账号的本地腿
+// 走分享直下（见 syncModeHint / submitTargets）。
 
 function findNetdiskTarget(): NetdiskTarget | undefined {
   return form.value.targets.find((t): t is NetdiskTarget => t.kind === 'netdisk')
@@ -943,13 +1183,173 @@ const localEnabled = computed<boolean>({
   set(on: boolean) { rebuildTargets(!!findNetdiskTarget(), on) },
 })
 
+// 本地目标的实际下载方式按「下载账号」决定（与后端按账号分腿一致）：
+// 下载账号同时有网盘目标 → 从该网盘副本下载；否则 → 分享直下（转临时目录→下载→清理）。
 const syncModeHint = computed(() => {
   const nd = netdiskEnabled.value
   const lo = localEnabled.value
-  if (nd && lo) return '从网盘副本下载到本地，网盘保留。'
-  if (nd) return ''
-  return '下载后清理网盘临时文件。'
+  if (!lo) return ''
+  const downloadUid = localDownloadUid()
+  const crossAccount = downloadUid !== null && downloadUid !== editingOwnerUid()
+  const who = crossAccount ? `下载账号（UID: ${downloadUid}）` : ''
+  if (localUsesNetdiskCopy()) {
+    return crossAccount ? `从${who}的网盘副本下载到本地，网盘保留。` : '从网盘副本下载到本地，网盘保留。'
+  }
+  if (nd) {
+    // 有网盘目标但不在下载账号上：网盘目标照常转存保留，本地由下载账号分享直下
+    return `网盘目标照常转存并保留；${who || '下载账号'}没有网盘目标，本地将以分享直下方式下载（下载后清理该账号的网盘临时文件）。`
+  }
+  return crossAccount ? `由${who}分享直下，下载后清理其网盘临时文件。` : '下载后清理网盘临时文件。'
 })
+
+// ==================== 跨账号目标（#179） ====================
+// 网盘目标可指定账号（缺省=订阅所属账号）；额外的网盘目标用于「多账号归集」，
+// 每个账号最多 1 个（与后端 validate 一致）。本地目标可指定下载账号或跟随全局默认下载账号。
+const extraNetdiskTargets = ref<NetdiskTarget[]>([])
+
+/** 实际生效的归集目标：「转存到网盘」关闭时不生效（列表保留为本次会话草稿，重新开启时恢复） */
+const visibleExtraNetdiskTargets = computed<NetdiskTarget[]>(() =>
+  netdiskEnabled.value ? extraNetdiskTargets.value : [],
+)
+
+/** 网盘目标落在的账号（null = 所属账号未知，按所属账号算） */
+function netdiskTargetAccounts(): Set<number | null> {
+  const owner = editingOwnerUid()
+  const set = new Set<number | null>()
+  const nd = findNetdiskTarget()
+  if (nd) set.add(explicitTargetUid(nd.account_uid) ?? owner)
+  for (const t of visibleExtraNetdiskTargets.value) set.add(explicitTargetUid(t.account_uid) ?? owner)
+  return set
+}
+
+/** 本地目标的下载账号：跟随所属 / 默认下载账号（未设置回退所属）/ 指定账号 */
+function localDownloadUid(): number | null {
+  const owner = editingOwnerUid()
+  const lo = findLocalTarget()
+  if (!lo) return null
+  if (lo.use_default_download_account) {
+    const d = downloadConfig.value?.default_download_account_uid
+    return typeof d === 'number' && d > 0 ? d : owner
+  }
+  return explicitTargetUid(lo.download_uid) ?? owner
+}
+
+/** 下载账号上是否有网盘目标（有 = 从网盘副本下载；无 = 分享直下） */
+function localUsesNetdiskCopy(): boolean {
+  if (!findLocalTarget()) return false
+  return netdiskTargetAccounts().has(localDownloadUid())
+}
+
+function editingOwnerUid(): number | null {
+  return selected.value?.owner_uid ?? null
+}
+
+/** 目标的显式账号：缺省 / 0 / 等于所属账号都视为「所属账号」(null) */
+function explicitTargetUid(uid: number | null | undefined): number | null {
+  if (typeof uid !== 'number' || uid <= 0) return null
+  return uid === editingOwnerUid() ? null : uid
+}
+
+const showTargetAccountControls = computed<boolean>(() => {
+  if (authStore.hasMultipleAccounts) return true
+  // 单账号时若订阅已带跨账号配置，仍展示以便查看/改回
+  const nd = findNetdiskTarget()
+  const lo = findLocalTarget()
+  return visibleExtraNetdiskTargets.value.length > 0
+      || explicitTargetUid(nd?.account_uid) !== null
+      || explicitTargetUid(lo?.download_uid) !== null
+      || !!lo?.use_default_download_account
+})
+
+const primaryNetdiskAccount = computed<number | null>({
+  get() {
+    const nd = findNetdiskTarget() ?? netdiskDraft.value
+    return explicitTargetUid(nd.account_uid) ?? editingOwnerUid()
+  },
+  set(v: number | null) {
+    const uid = explicitTargetUid(v)
+    const apply = (t: NetdiskTarget) => {
+      // save_fs_id 是原账号的目录 id，换账号后失效
+      if (explicitTargetUid(t.account_uid) !== uid) t.save_fs_id = 0
+      t.account_uid = uid
+    }
+    const nd = findNetdiskTarget()
+    if (nd) apply(nd)
+    apply(netdiskDraft.value)
+  },
+})
+
+type LocalDownloadAccountChoice = 'owner' | 'default' | number
+const localDownloadAccount = computed<LocalDownloadAccountChoice>({
+  get() {
+    const lo = findLocalTarget() ?? localDraft.value
+    if (lo.use_default_download_account) return 'default'
+    return explicitTargetUid(lo.download_uid) ?? 'owner'
+  },
+  set(v: LocalDownloadAccountChoice) {
+    const apply = (t: LocalTarget) => {
+      t.use_default_download_account = v === 'default'
+      t.download_uid = typeof v === 'number' ? explicitTargetUid(v) : null
+    }
+    const lo = findLocalTarget()
+    if (lo) apply(lo)
+    apply(localDraft.value)
+  },
+})
+
+const defaultDownloadAccountLabel = computed(() => {
+  const uid = downloadConfig.value?.default_download_account_uid
+  if (typeof uid !== 'number' || uid <= 0) return '默认下载账号（未设置，回退所属账号）'
+  const acc = authStore.accounts.find(a => a.uid === uid)
+  return `默认下载账号（${acc ? acc.nickname || acc.username : `UID: ${uid}`}）`
+})
+
+const crossAccountHint = computed(() => {
+  const nd = findNetdiskTarget()
+  const lo = findLocalTarget()
+  const ndUid = nd ? explicitTargetUid(nd.account_uid) : null
+  const loUid = lo ? (lo.use_default_download_account ? 'default' : explicitTargetUid(lo.download_uid)) : null
+  if (visibleExtraNetdiskTargets.value.length === 0 && ndUid === null && loUid === null) return ''
+  return '跨账号目标按账号分别执行，涉及的各账号都需保持登录。'
+})
+
+function addExtraNetdiskTarget() {
+  // 默认选一个还没有网盘目标的已登录账号，避免新增行直接与已有目标撞账号
+  const owner = editingOwnerUid()
+  const used = new Set<number | null>()
+  const nd = findNetdiskTarget()
+  if (nd) used.add(explicitTargetUid(nd.account_uid) ?? owner)
+  for (const t of extraNetdiskTargets.value) used.add(explicitTargetUid(t.account_uid) ?? owner)
+  const free = authStore.accounts.find(a => !used.has(a.uid))
+  extraNetdiskTargets.value.push({
+    kind: 'netdisk',
+    remote_path: netdiskRemotePath.value || '/',
+    save_fs_id: 0,
+    conflict_strategy: null,
+    account_uid: free?.uid ?? null,
+  })
+}
+
+function removeExtraNetdiskTarget(idx: number) {
+  extraNetdiskTargets.value.splice(idx, 1)
+}
+
+/** 把订阅目标拆成「主网盘 + 本地」(表单开关模型) 与「额外归集网盘目标」 */
+function splitTargetsForEdit(targets: SyncTarget[]): { main: SyncTarget[]; extras: NetdiskTarget[] } {
+  const main: SyncTarget[] = []
+  const extras: NetdiskTarget[] = []
+  let seenNetdisk = false
+  for (const t of targets) {
+    if (t.kind === 'netdisk') {
+      if (seenNetdisk) extras.push({ ...t })
+      else main.push({ ...t })
+      seenNetdisk = true
+    } else {
+      main.push({ ...t })
+    }
+  }
+  return { main, extras }
+}
 
 const netdiskRemotePath = computed<string>({
   get() { return findNetdiskTarget()?.remote_path ?? netdiskDraft.value.remote_path },
@@ -1148,7 +1548,7 @@ function openEdit(s?: ShareSubscription) {
     exclude_patterns: [...selected.value.exclude_patterns],
     exclude_regex_patterns: [...(selected.value.exclude_regex_patterns ?? [])],
     exclude_paths: [...(selected.value.exclude_paths ?? [])],
-    targets: selected.value.targets.map(t => ({ ...t })) as SyncTarget[],
+    targets: [] as SyncTarget[],
     conflict_strategy: selected.value.conflict_strategy,
     delete_missing: selected.value.delete_missing,
     poll_config: normalizePollConfigForUi(selected.value.poll_config),
@@ -1162,6 +1562,13 @@ function openEdit(s?: ShareSubscription) {
     form.value.poll_config.schedule_hour = null
     form.value.poll_config.schedule_minute = null
   }
+  // 刷新「默认下载账号」（可能在设置页改过），只影响下载账号下拉的提示文案
+  getConfig()
+      .then((cfg) => { downloadConfig.value = cfg.download })
+      .catch(() => { /* 保留已加载的配置 */ })
+  const { main, extras } = splitTargetsForEdit(selected.value.targets)
+  form.value.targets = main
+  extraNetdiskTargets.value = extras
   seedTargetDrafts(form.value.targets)
   dialogVisible.value = true
 }
@@ -1179,6 +1586,7 @@ function getApiErrorMessage(e: unknown): string {
 function resetForm() {
   formRef.value?.resetFields?.()
   seedTargetDrafts(defaultForm().targets)
+  extraNetdiskTargets.value = []
 }
 
 async function saveForm() {
@@ -1209,7 +1617,7 @@ async function saveForm() {
         exclude_patterns: form.value.exclude_patterns,
         exclude_regex_patterns: form.value.exclude_regex_patterns,
         exclude_paths: form.value.exclude_paths,
-        targets: form.value.targets,
+        targets: submitTargets(),
         conflict_strategy: form.value.conflict_strategy,
         delete_missing: form.value.delete_missing,
         poll_config: form.value.poll_config,
@@ -1232,19 +1640,31 @@ function validateForm(): boolean {
     return false
   }
 
-  // 目标模型收窄：最多 1 网盘 + 1 本地（与后端 validate 一致）
-  const { netdisk, local } = targetKindCounts()
-  if (netdisk > 1) {
-    ElMessage.error('最多只能配置 1 个网盘目标')
-    return false
+  // 目标模型：每个账号最多 1 个网盘目标 + 最多 1 个本地目标（与后端 validate 一致）
+  const { local } = targetKindCounts()
+  const owner = editingOwnerUid()
+  const netdiskAccounts = new Set<number | null>()
+  for (const t of submitTargets()) {
+    if (t.kind !== 'netdisk') continue
+    const uid = explicitTargetUid(t.account_uid) ?? owner
+    if (netdiskAccounts.has(uid)) {
+      ElMessage.error(
+        uid === owner
+          ? '最多只能配置 1 个网盘目标（多个网盘目标需分属不同账号）'
+          : `同一账号最多只能配置 1 个网盘目标（UID: ${uid}）`,
+      )
+      return false
+    }
+    netdiskAccounts.add(uid)
   }
   if (local > 1) {
     ElMessage.error('最多只能配置 1 个本地目标')
     return false
   }
 
-  for (let i = 0; i < form.value.targets.length; i++) {
-    const t = form.value.targets[i] as NetdiskTarget | LocalTarget
+  const allTargets = submitTargets()
+  for (let i = 0; i < allTargets.length; i++) {
+    const t = allTargets[i] as NetdiskTarget | LocalTarget
     if (t.kind === 'netdisk') {
       if (!t.remote_path || !String(t.remote_path).trim()) {
         ElMessage.error(`目标 #${i + 1}：网盘路径不能为空`)
@@ -1316,6 +1736,21 @@ function normalizePath(v: string): string {
   return prefixed.endsWith('/') ? prefixed.slice(0, -1) : prefixed
 }
 
+/**
+ * 选中的同步 / 排除路径提交前归一：只规整分隔符，文件名里的空白（含结尾空格）
+ * 原样保留 —— 否则「报告. 」会被存成「报告.」，选中与排除都会串到同名文件上。
+ * 手工输入的网盘 / 本地目标路径仍走 normalizePath（需要 trim）。
+ */
+function normalizeSelectedPath(v: string): string {
+  if (!v.trim()) return ''
+  const lead = /^\s*/.exec(v)?.[0] ?? ''
+  const rest = lead.length > 0 && v.charAt(lead.length) === '/' ? v.slice(lead.length) : v
+  const collapsed = rest.replace(/\/+/g, '/')
+  const prefixed = collapsed.startsWith('/') ? collapsed : `/${collapsed}`
+  if (prefixed.length === 1) return '/'
+  return prefixed.endsWith('/') ? prefixed.slice(0, -1) : prefixed
+}
+
 function normalizeRemotePath(v: string): string {
   return normalizePath(v) || '/'
 }
@@ -1323,7 +1758,7 @@ function normalizeRemotePath(v: string): string {
 function buildSanitizedPayload() {
   const includeSet = new Set<string>()
   for (const p of form.value.include_paths) {
-    const n = normalizePath(p)
+    const n = normalizeSelectedPath(p)
     if (n) {
       includeSet.add(n)
     }
@@ -1344,7 +1779,7 @@ function buildSanitizedPayload() {
   }
   const excludePathSet = new Set<string>()
   for (const p of form.value.exclude_paths) {
-    const n = normalizePath(p)
+    const n = normalizeSelectedPath(p)
     if (n) {
       excludePathSet.add(n)
     }
@@ -1354,8 +1789,24 @@ function buildSanitizedPayload() {
   form.value.exclude_regex_patterns = Array.from(regexSet)
   form.value.exclude_paths = Array.from(excludePathSet)
 
+  // 额外归集网盘目标单独归一化（保持表单模型不变，校验失败时界面状态不丢）
+  extraNetdiskTargets.value = sanitizeTargets(extraNetdiskTargets.value)
+      .filter((t): t is NetdiskTarget => t.kind === 'netdisk')
+  form.value.targets = sanitizeTargets(form.value.targets)
+  form.value.poll_config = normalizePollConfigForSubmit(form.value.poll_config)
+}
+
+/** 提交给后端的完整目标列表：主网盘/本地 + 额外归集网盘目标 */
+function submitTargets(): SyncTarget[] {
+  // 本地目标的 mode 与实际执行方式对齐（后端按账号分腿推导，这里只让存档自洽）
+  const mode: LocalTarget['mode'] = localUsesNetdiskCopy() ? 'transfer_and_download' : 'share_direct'
+  const main = form.value.targets.map(t => (t.kind === 'local' ? { ...t, mode } : t))
+  return [...main, ...visibleExtraNetdiskTargets.value]
+}
+
+function sanitizeTargets(targets: SyncTarget[]): SyncTarget[] {
   const nextTargets: SyncTarget[] = []
-  for (const raw of form.value.targets) {
+  for (const raw of targets) {
     const t = raw as NetdiskTarget | LocalTarget
     if (!t.kind) {
       continue
@@ -1367,6 +1818,7 @@ function buildSanitizedPayload() {
         remote_path: remote,
         save_fs_id: Number.isFinite(Number(t.save_fs_id)) ? Number(t.save_fs_id) : 0,
         ...(t.conflict_strategy ? { conflict_strategy: t.conflict_strategy } : {}),
+        ...(explicitTargetUid(t.account_uid) !== null ? { account_uid: explicitTargetUid(t.account_uid) } : {}),
       })
     } else if (t.kind === 'local') {
       // 本地路径只做 trim，不做 / 归一化（保留 Windows 的 D:\ 等平台路径原样交后端）
@@ -1376,11 +1828,15 @@ function buildSanitizedPayload() {
         local_path: local,
         mode: t.mode === 'transfer_and_download' ? 'transfer_and_download' : 'share_direct',
         ...(t.conflict_strategy ? { conflict_strategy: t.conflict_strategy } : {}),
+        ...(t.use_default_download_account
+          ? { use_default_download_account: true }
+          : explicitTargetUid(t.download_uid) !== null
+            ? { download_uid: explicitTargetUid(t.download_uid) }
+            : {}),
       })
     }
   }
-  form.value.targets = nextTargets
-  form.value.poll_config = normalizePollConfigForSubmit(form.value.poll_config)
+  return nextTargets
 }
 
 async function removeSubscription(s?: ShareSubscription) {
@@ -1491,6 +1947,10 @@ async function cancelScanNow(s?: ShareSubscription) {
 }
 
 async function openRun(runId: string) {
+  // 换 run：筛选条件归零，并作废上一个 run 还在路上的明细请求
+  resetRunItemFilter()
+  runItemsRequestVersion++
+  runItemsLoading.value = false
   try {
     currentRunId.value = runId
     currentRun.value = await getRun(runId)
@@ -1500,18 +1960,8 @@ async function openRun(runId: string) {
   }
 }
 
-async function onRunItemsPageChange(page: number) {
-  if (!currentRunId.value || !currentRun.value) return
-  runItemsLoading.value = true
-  try {
-    const res = await listRunItems(currentRunId.value, page, currentRun.value.item_page_size)
-    currentRun.value.items = res.items
-    currentRun.value.item_page = res.page
-  } catch (e) {
-    ElMessage.error(`加载运行明细失败: ${getApiErrorMessage(e)}`)
-  } finally {
-    runItemsLoading.value = false
-  }
+function onRunItemsPageChange(page: number) {
+  void loadRunItems(page)
 }
 
 // ==================== 本地目录选择（对齐转存） ====================
@@ -1593,8 +2043,19 @@ function describeInterval(p: PollConfig): string {
   return '已禁用'
 }
 
-function describeTargets(targets: SyncTarget[]): string {
-  return targets.map(t => t.kind === 'netdisk' ? '网盘' : '本地').join(' + ')
+function describeTargets(targets: SyncTarget[], ownerUid?: number | null): string {
+  // 只标注落在其他账号上的目标（缺省 / 0 / 等于所属账号都是所属账号）
+  const other = (uid: number | null | undefined) =>
+    typeof uid === 'number' && uid > 0 && uid !== ownerUid ? uid : null
+  return targets.map(t => {
+    if (t.kind === 'netdisk') {
+      const uid = other(t.account_uid)
+      return uid !== null ? `网盘(UID ${uid})` : '网盘'
+    }
+    if (t.use_default_download_account) return '本地(默认下载账号)'
+    const uid = other(t.download_uid)
+    return uid !== null ? `本地(UID ${uid})` : '本地'
+  }).join(' + ')
 }
 
 function describeStrategy(s: ConflictStrategy): string {
@@ -1668,6 +2129,9 @@ function describeAction(_r: unknown, _c: unknown, v: string): string {
   return ACTION_LABELS[v] ?? v
 }
 function describeTarget(_r: unknown, _c: unknown, v: string): string {
+  // 跨账号执行腿的动作记为 `netdisk@<uid>` / `local@<uid>`（所属账号不带后缀）
+  const m = /^(.+)@(\d+)$/.exec(v || '')
+  if (m) return `${TARGET_LABELS[m[1]] ?? m[1]}(UID ${m[2]})`
   return TARGET_LABELS[v] ?? v
 }
 function describeItemStatus(_r: unknown, _c: unknown, v: string): string {
@@ -2027,6 +2491,7 @@ onMounted(async () => {
 })
 
 onUnmounted(() => {
+  clearRunItemKeywordTimer()
   unsubWs?.()
   unsubConnState?.()
   subtaskPoller.stop()
@@ -2081,10 +2546,7 @@ onUnmounted(() => {
   padding: 16px 20px;
 }
 
-// 移动端底部为 fixed 标签栏（56px + 安全区）：限制本页高度，余下由 .ss-content 内部滚动
-.main-layout.is-mobile .share-sync-view {
-  max-height: calc(100vh - 60px - 56px - env(safe-area-inset-bottom, 0px));
-}
+// 移动端高度由 MainLayout 的 .main-content 约束（已扣除顶部栏与 fixed 标签栏），余下由 .ss-content 内部滚动
 .main-layout.is-mobile .ss-content {
   padding-bottom: 12px;
 }
@@ -2363,12 +2825,45 @@ onUnmounted(() => {
     flex: 1 1 240px;
     min-width: 0;
   }
+
+  .target-account-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-top: 6px;
+    padding-left: 48px;
+  }
+
+  .target-account-label {
+    font-size: 12px;
+    color: #909399;
+    white-space: nowrap;
+  }
+
+  .target-account-select { width: 220px; }
 }
 
 .run-item { cursor: pointer; &:hover { color: #409eff; } }
 .run-stats { font-size: 12px; color: #909399; margin-top: 2px; }
 
 .run-detail { h4 { margin: 16px 0 8px; } }
+.run-items-header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin: 16px 0 8px;
+  h4 { margin: 0; }
+}
+.run-items-filters {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  .run-item-status-filter,
+  .run-item-action-filter { width: 130px; }
+  .run-item-keyword-filter { width: 160px; }
+}
 
 .path-editor {
   display: flex;

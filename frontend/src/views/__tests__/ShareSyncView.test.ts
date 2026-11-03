@@ -576,6 +576,27 @@ describe('ShareSyncView 扫描当前路径展示', () => {
   })
 })
 
+describe('ShareSyncView 排除内容文案', () => {
+  it('卡片摘要与详情都用「排除内容」措辞', async () => {
+    const wrapper = mountView()
+    await flushPromises()
+
+    const card = document.body.querySelector<HTMLElement>('.config-card')!
+    expect(card.textContent).toContain('排除内容 1 项')
+    expect(card.textContent, '不再使用「排除目录」措辞').not.toContain('排除目录')
+
+    card.click()
+    await flushPromises()
+
+    const labels = Array.from(
+        document.body.querySelectorAll<HTMLElement>('.el-descriptions__label'),
+    ).map((el) => el.textContent?.trim())
+    expect(labels).toContain('排除内容')
+    expect(labels, '详情不再使用「排除目录」措辞').not.toContain('排除目录')
+    wrapper.unmount()
+  })
+})
+
 describe('ShareSyncView 正则排除规则', () => {
   const WITH_REGEX = {
     ...SUB,
@@ -709,6 +730,556 @@ describe('ShareSyncView 正则排除规则', () => {
 
     const req = api.updateSubscription.mock.calls[0][1] as { exclude_regex_patterns: string[] }
     expect(req.exclude_regex_patterns).toEqual([])
+    wrapper.unmount()
+  })
+})
+
+describe('ShareSyncView 跨账号目标（#179）', () => {
+  const saveButton = () => Array.from(document.body.querySelectorAll<HTMLElement>('button'))
+      .find((b) => b.textContent?.trim() === '保存')!
+
+  function editButton(name: string): HTMLElement {
+    const card = Array.from(document.body.querySelectorAll<HTMLElement>('.config-card'))
+        .find((el) => el.textContent?.includes(name))
+    return Array.from((card ?? document.body).querySelectorAll<HTMLElement>('button'))
+        .find((b) => b.textContent?.trim() === '编辑')!
+  }
+
+  afterEach(() => {
+    auth.hasMultipleAccounts = false
+    auth.accounts = [{ uid: 1, username: 'u', nickname: null }]
+  })
+
+  it('老订阅保存时不写入账号字段', async () => {
+    api.updateSubscription.mockResolvedValue({ ...SUB })
+    const wrapper = mountView()
+    await flushPromises()
+    editButton(SUB.name).click()
+    await flushPromises()
+    expect(document.body.querySelector('.subscription-dialog .target-account-row'), '单账号老订阅不展示账号控件').toBeNull()
+    saveButton().click()
+    await flushPromises()
+    const req = api.updateSubscription.mock.calls[0][1] as { targets: Array<Record<string, unknown>> }
+    expect(req.targets).toEqual([{ kind: 'local', local_path: '/tmp', mode: 'share_direct' }])
+    wrapper.unmount()
+  })
+
+  it('已有跨账号目标原样保留（归集网盘 + 默认下载账号），卡片标明账号', async () => {
+    const sub = {
+      ...SUB,
+      targets: [
+        { kind: 'netdisk', remote_path: '/主', save_fs_id: 0 },
+        { kind: 'local', local_path: '/tmp', mode: 'transfer_and_download', use_default_download_account: true },
+        { kind: 'netdisk', remote_path: '/归集', save_fs_id: 0, account_uid: 2 },
+      ],
+    }
+    api.listSubscriptions.mockResolvedValue([sub])
+    api.updateSubscription.mockResolvedValue(sub)
+    const wrapper = mountView()
+    await flushPromises()
+
+    const card = document.body.querySelector<HTMLElement>('.config-card')!
+    expect(card.textContent).toContain('网盘(UID 2)')
+    expect(card.textContent).toContain('本地(默认下载账号)')
+
+    editButton(sub.name).click()
+    await flushPromises()
+    expect(document.body.querySelectorAll('.subscription-dialog .extra-netdisk-row').length).toBe(1)
+    saveButton().click()
+    await flushPromises()
+
+    const req = api.updateSubscription.mock.calls[0][1] as { targets: Array<Record<string, unknown>> }
+    expect(req.targets).toEqual([
+      { kind: 'netdisk', remote_path: '/主', save_fs_id: 0 },
+      { kind: 'local', local_path: '/tmp', mode: 'transfer_and_download', use_default_download_account: true },
+      { kind: 'netdisk', remote_path: '/归集', save_fs_id: 0, account_uid: 2 },
+    ])
+    wrapper.unmount()
+  })
+
+  it('多账号可新增归集目标，默认选未占用账号；同账号重复时拒绝保存', async () => {
+    auth.hasMultipleAccounts = true
+    auth.accounts = [
+      { uid: 1, username: 'u', nickname: null },
+      { uid: 2, username: 'v', nickname: null },
+    ]
+    const sub = { ...SUB, targets: [{ kind: 'netdisk', remote_path: '/主', save_fs_id: 0 }] }
+    api.listSubscriptions.mockResolvedValue([sub])
+    api.updateSubscription.mockResolvedValue(sub)
+    const wrapper = mountView()
+    await flushPromises()
+    editButton(sub.name).click()
+    await flushPromises()
+
+    const addBtn = () => Array.from(document.body.querySelectorAll<HTMLElement>('.subscription-dialog button'))
+        .find((b) => b.textContent?.includes('同时转存到其他账号的网盘'))!
+    addBtn().click()
+    await flushPromises()
+    saveButton().click()
+    await flushPromises()
+    expect(api.updateSubscription).toHaveBeenCalledTimes(1)
+    let req = api.updateSubscription.mock.calls[0][1] as { targets: Array<Record<string, unknown>> }
+    expect(req.targets).toEqual([
+      { kind: 'netdisk', remote_path: '/主', save_fs_id: 0 },
+      { kind: 'netdisk', remote_path: '/主', save_fs_id: 0, account_uid: 2 },
+    ])
+
+    // 再次打开并新增两行：第二行已无空闲账号，回落到所属账号 → 与主网盘目标同账号，校验拦截
+    editButton(sub.name).click()
+    await flushPromises()
+    addBtn().click()
+    await flushPromises()
+    addBtn().click()
+    await flushPromises()
+    expect(document.body.querySelectorAll('.subscription-dialog .extra-netdisk-row').length).toBe(2)
+    saveButton().click()
+    await flushPromises()
+    expect(api.updateSubscription).toHaveBeenCalledTimes(1)
+    expect(document.body.textContent).toContain('多个网盘目标需分属不同账号')
+
+    // 移除重复行后可保存
+    const removeBtn = document.body.querySelector<HTMLElement>('.subscription-dialog [aria-label="移除归集目标 #2"]')!
+    removeBtn.click()
+    await flushPromises()
+    saveButton().click()
+    await flushPromises()
+    expect(api.updateSubscription).toHaveBeenCalledTimes(2)
+    req = api.updateSubscription.mock.calls[1][1] as { targets: Array<Record<string, unknown>> }
+    expect(req.targets).toEqual([
+      { kind: 'netdisk', remote_path: '/主', save_fs_id: 0 },
+      { kind: 'netdisk', remote_path: '/主', save_fs_id: 0, account_uid: 2 },
+    ])
+    wrapper.unmount()
+  })
+  const dialogSwitches = () => Array.from(document.body.querySelectorAll<HTMLElement>('.subscription-dialog .el-switch'))
+  const hints = () => Array.from(document.body.querySelectorAll<HTMLElement>('.subscription-dialog .sync-mode-hint'))
+      .map((el) => el.textContent?.trim() ?? '')
+
+  it('关闭「转存到网盘」后归集目标隐藏且不提交；重开对话框开关保持关闭', async () => {
+    auth.hasMultipleAccounts = true
+    auth.accounts = [
+      { uid: 1, username: 'u', nickname: null },
+      { uid: 2, username: 'v', nickname: null },
+    ]
+    const sub = {
+      ...SUB,
+      targets: [
+        { kind: 'netdisk', remote_path: '/主', save_fs_id: 0 },
+        { kind: 'local', local_path: '/tmp', mode: 'transfer_and_download' },
+        { kind: 'netdisk', remote_path: '/归集', save_fs_id: 0, account_uid: 2 },
+      ],
+    }
+    api.listSubscriptions.mockResolvedValue([sub])
+    const wrapper = mountView()
+    await flushPromises()
+    editButton(sub.name).click()
+    await flushPromises()
+    const addBtn = () => Array.from(document.body.querySelectorAll<HTMLElement>('.subscription-dialog button'))
+        .find((b) => b.textContent?.includes('同时转存到其他账号的网盘'))
+    expect(document.body.querySelectorAll('.subscription-dialog .extra-netdisk-row').length).toBe(1)
+    expect(addBtn()).toBeTruthy()
+
+    dialogSwitches()[0].click()
+    await flushPromises()
+    expect(document.body.querySelectorAll('.subscription-dialog .extra-netdisk-row').length, '归集行随开关隐藏').toBe(0)
+    expect(addBtn(), '新增按钮随开关隐藏').toBeUndefined()
+
+    let saved: typeof sub | null = null
+    api.updateSubscription.mockImplementation(async (_id: string, req: { targets: typeof sub.targets }) => {
+      saved = { ...sub, targets: req.targets }
+      return saved
+    })
+    saveButton().click()
+    await flushPromises()
+    const req = api.updateSubscription.mock.calls[0][1] as { targets: Array<Record<string, unknown>> }
+    expect(req.targets).toEqual([{ kind: 'local', local_path: '/tmp', mode: 'share_direct' }])
+
+    // 往返稳定：用保存后的目标重新打开，网盘开关仍关闭、没有 UID 2 的目标被提升为主网盘
+    api.listSubscriptions.mockResolvedValue([saved!])
+    wrapper.unmount()
+    const wrapper2 = mountView()
+    await flushPromises()
+    editButton(sub.name).click()
+    await flushPromises()
+    expect(dialogSwitches()[0].classList.contains('is-checked')).toBe(false)
+    expect(document.body.querySelectorAll('.subscription-dialog .extra-netdisk-row').length).toBe(0)
+    wrapper2.unmount()
+  })
+
+  it('关闭后再开启「转存到网盘」恢复本次会话里的归集目标', async () => {
+    auth.hasMultipleAccounts = true
+    auth.accounts = [
+      { uid: 1, username: 'u', nickname: null },
+      { uid: 2, username: 'v', nickname: null },
+    ]
+    const sub = {
+      ...SUB,
+      targets: [
+        { kind: 'netdisk', remote_path: '/主', save_fs_id: 0 },
+        { kind: 'local', local_path: '/tmp', mode: 'transfer_and_download' },
+        { kind: 'netdisk', remote_path: '/归集', save_fs_id: 0, account_uid: 2 },
+      ],
+    }
+    api.listSubscriptions.mockResolvedValue([sub])
+    api.updateSubscription.mockResolvedValue(sub)
+    const wrapper = mountView()
+    await flushPromises()
+    editButton(sub.name).click()
+    await flushPromises()
+    dialogSwitches()[0].click()
+    await flushPromises()
+    dialogSwitches()[0].click()
+    await flushPromises()
+    expect(document.body.querySelectorAll('.subscription-dialog .extra-netdisk-row').length).toBe(1)
+    saveButton().click()
+    await flushPromises()
+    const req = api.updateSubscription.mock.calls[0][1] as { targets: Array<Record<string, unknown>> }
+    expect(req.targets).toEqual(sub.targets)
+    wrapper.unmount()
+  })
+
+  it('A 账号存网盘 + B 账号下载到本地：提示不再矛盾，本地按分享直下保存', async () => {
+    auth.hasMultipleAccounts = true
+    auth.accounts = [
+      { uid: 1, username: 'u', nickname: null },
+      { uid: 2, username: 'v', nickname: null },
+    ]
+    const sub = {
+      ...SUB,
+      targets: [
+        { kind: 'netdisk', remote_path: '/主', save_fs_id: 0 },
+        { kind: 'local', local_path: '/tmp', mode: 'transfer_and_download', download_uid: 2 },
+      ],
+    }
+    api.listSubscriptions.mockResolvedValue([sub])
+    api.updateSubscription.mockResolvedValue(sub)
+    const wrapper = mountView()
+    await flushPromises()
+    editButton(sub.name).click()
+    await flushPromises()
+    const text = hints().join('\n')
+    expect(text).not.toContain('从网盘副本下载到本地')
+    expect(text).toContain('UID: 2')
+    expect(text).toContain('分享直下')
+    expect(text).toContain('网盘目标照常转存并保留')
+    saveButton().click()
+    await flushPromises()
+    const req = api.updateSubscription.mock.calls[0][1] as { targets: Array<Record<string, unknown>> }
+    expect(req.targets).toEqual([
+      { kind: 'netdisk', remote_path: '/主', save_fs_id: 0 },
+      { kind: 'local', local_path: '/tmp', mode: 'share_direct', download_uid: 2 },
+    ])
+    wrapper.unmount()
+  })
+
+  it('下载账号同时有归集网盘目标时，提示从该账号网盘副本下载', async () => {
+    auth.hasMultipleAccounts = true
+    auth.accounts = [
+      { uid: 1, username: 'u', nickname: null },
+      { uid: 2, username: 'v', nickname: null },
+    ]
+    const sub = {
+      ...SUB,
+      targets: [
+        { kind: 'netdisk', remote_path: '/主', save_fs_id: 0 },
+        { kind: 'local', local_path: '/tmp', mode: 'share_direct', download_uid: 2 },
+        { kind: 'netdisk', remote_path: '/归集', save_fs_id: 0, account_uid: 2 },
+      ],
+    }
+    api.listSubscriptions.mockResolvedValue([sub])
+    api.updateSubscription.mockResolvedValue(sub)
+    const wrapper = mountView()
+    await flushPromises()
+    editButton(sub.name).click()
+    await flushPromises()
+    const text = hints().join('\n')
+    expect(text).toContain('从下载账号（UID: 2）的网盘副本下载到本地，网盘保留。')
+    expect(text).not.toContain('分享直下')
+    saveButton().click()
+    await flushPromises()
+    const req = api.updateSubscription.mock.calls[0][1] as { targets: Array<Record<string, unknown>> }
+    expect(req.targets[1]).toEqual({ kind: 'local', local_path: '/tmp', mode: 'transfer_and_download', download_uid: 2 })
+    wrapper.unmount()
+  })
+})
+
+describe('ShareSyncView 运行详情文件动作筛选', () => {
+  const FACETS = {
+    status_counts: { completed: 7200, failed: 157, skipped: 120, downloading: 7 },
+    action_counts: { added: 7000, modified: 400, skipped: 84 },
+  }
+  const RUN_DETAIL = {
+    id: 'run-9',
+    started_at: 1,
+    finished_at: 2,
+    status: 'completed_with_errors',
+    total_count: 7484,
+    added_count: 7000,
+    modified_count: 400,
+    removed_count: 0,
+    unchanged_count: 0,
+    failed_count: 157,
+    skipped_count: 84,
+    overwritten_count: 400,
+    error: null,
+    items: [],
+    item_total_count: 7484,
+    item_page: 1,
+    item_page_size: 100,
+    item_facets: FACETS,
+  }
+
+  type Vm = {
+    openRun: (id: string) => Promise<void>
+    onRunItemsPageChange: (page: number) => void
+    applyRunItemFilter: () => void
+    runItemFilter: { status: string; action: string; q: string }
+    runItemStatusOptions: Array<{ value: string; label: string }>
+    runItemActionOptions: Array<{ value: string; label: string }>
+    runItemsHeaderCount: string
+    currentRun: { item_page: number; item_total_count: number } | null
+  }
+
+  async function mountAndOpenRun() {
+    api.getRun.mockReset().mockResolvedValue(structuredClone(RUN_DETAIL))
+    api.listRunItems.mockReset().mockImplementation(
+        async (_id: string, page: number, pageSize: number, filter?: { status?: string }) => ({
+          items: [],
+          total: filter?.status === 'failed' ? 157 : 7484,
+          page,
+          page_size: pageSize,
+          facets: FACETS,
+        }),
+    )
+    const wrapper = mount(ShareSyncView, {
+      attachTo: document.body,
+      global: {
+        plugins: [ElementPlus],
+        // happy-dom 下 el-table 的 MutationObserver 不可用，表格本身不在本组测试范围
+        stubs: {
+          AccountFilter: true, AccountBadge: true, TransferDialog: true,
+          ShareIncludeExcludeEditor: true, CronExprEditor: true, FilePickerModal: true,
+          'el-table': true, 'el-table-column': true,
+        },
+      },
+    })
+    await flushPromises()
+    const vm = wrapper.vm as unknown as Vm
+    await vm.openRun('run-9')
+    await flushPromises()
+    return { wrapper, vm }
+  }
+
+  it('筛选选项显示整个 run 的分组计数，进行中合并未终态状态', async () => {
+    const { wrapper, vm } = await mountAndOpenRun()
+    const status = Object.fromEntries(vm.runItemStatusOptions.map((o) => [o.value, o.label]))
+    expect(status).toEqual({
+      all: '全部状态（7484）',
+      failed: '失败（157）',
+      completed: '完成（7200）',
+      skipped: '跳过（120）',
+      in_progress: '进行中（7）',
+    })
+    const action = Object.fromEntries(vm.runItemActionOptions.map((o) => [o.value, o.label]))
+    expect(action).toEqual({
+      all: '全部动作（7484）',
+      added: '新增（7000）',
+      modified: '修改（400）',
+      removed: '删除（0）',
+      skipped: '跳过（84）',
+    })
+    expect(vm.runItemsHeaderCount).toBe('7484')
+    wrapper.unmount()
+  })
+
+  it('点「只看失败」按失败筛选、回到第 1 页，total 用筛选后的条数', async () => {
+    const { wrapper, vm } = await mountAndOpenRun()
+    vm.onRunItemsPageChange(40)
+    await flushPromises()
+    expect(vm.currentRun!.item_page).toBe(40)
+
+    const link = document.body.querySelector<HTMLElement>('.run-failed-link')
+    expect(link, '有失败项时应显示「只看失败」').toBeTruthy()
+    link!.click()
+    await flushPromises()
+
+    expect(api.listRunItems).toHaveBeenLastCalledWith('run-9', 1, 100, { status: 'failed', action: 'all', q: '' })
+    expect(vm.currentRun!.item_page).toBe(1)
+    expect(vm.currentRun!.item_total_count).toBe(157)
+    expect(vm.runItemsHeaderCount).toBe('筛选出 157 / 共 7484')
+    // 翻页沿用当前筛选
+    vm.onRunItemsPageChange(2)
+    await flushPromises()
+    expect(api.listRunItems).toHaveBeenLastCalledWith('run-9', 2, 100, { status: 'failed', action: 'all', q: '' })
+    wrapper.unmount()
+  })
+
+  it('路径关键字输入防抖后查询，换 run 时筛选归零', async () => {
+    vi.useFakeTimers()
+    try {
+      const { wrapper, vm } = await mountAndOpenRun()
+      const input = document.body.querySelector<HTMLInputElement>('.run-item-keyword-filter input')
+      expect(input).toBeTruthy()
+      input!.value = 'S01'
+      input!.dispatchEvent(new Event('input'))
+      await flushPromises()
+      expect(api.listRunItems).not.toHaveBeenCalled()
+      vi.advanceTimersByTime(300)
+      await flushPromises()
+      expect(api.listRunItems).toHaveBeenCalledTimes(1)
+      expect(api.listRunItems).toHaveBeenLastCalledWith('run-9', 1, 100, { status: 'all', action: 'all', q: 'S01' })
+
+      await vm.openRun('run-9')
+      await flushPromises()
+      expect(vm.runItemFilter).toEqual({ status: 'all', action: 'all', q: '' })
+      wrapper.unmount()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('慢的旧请求回包不覆盖新筛选结果', async () => {
+    const { wrapper, vm } = await mountAndOpenRun()
+    let resolveOld!: (v: unknown) => void
+    api.listRunItems.mockImplementationOnce(() => new Promise((r) => { resolveOld = r }))
+    vm.onRunItemsPageChange(5)
+    vm.runItemFilter.status = 'failed'
+    vm.applyRunItemFilter()
+    await flushPromises()
+    expect(vm.currentRun!.item_total_count).toBe(157)
+    resolveOld({ items: [], total: 7484, page: 5, page_size: 100, facets: FACETS })
+    await flushPromises()
+    expect(vm.currentRun!.item_total_count).toBe(157)
+    expect(vm.currentRun!.item_page).toBe(1)
+    wrapper.unmount()
+  })
+
+  it('API 客户端只在有筛选时附加查询参数（未筛选时与旧请求一致）', async () => {
+    const { rawApiClient } = await import('@/api/client')
+    const actual = await vi.importActual<typeof import('@/api/shareSync')>('@/api/shareSync')
+    const get = vi.spyOn(rawApiClient, 'get').mockResolvedValue({ data: { success: true, data: {} } })
+    try {
+      await actual.listRunItems('r', 2, 100)
+      expect(get).toHaveBeenLastCalledWith('/share-sync/runs/r/items', { params: { page: 2, page_size: 100 } })
+      await actual.listRunItems('r', 1, 100, { status: 'all', action: 'all', q: '  ' })
+      expect(get).toHaveBeenLastCalledWith('/share-sync/runs/r/items', { params: { page: 1, page_size: 100 } })
+      await actual.listRunItems('r', 1, 100, { status: 'failed', action: 'modified', q: ' 第1集 ' })
+      expect(get).toHaveBeenLastCalledWith('/share-sync/runs/r/items', {
+        params: { page: 1, page_size: 100, status: 'failed', action: 'modified', q: '第1集' },
+      })
+      await actual.getRun('r', 1, 100, { status: 'failed' })
+      expect(get).toHaveBeenLastCalledWith('/share-sync/runs/r', {
+        params: { page: 1, page_size: 100, status: 'failed' },
+      })
+    } finally {
+      get.mockRestore()
+    }
+  })
+})
+
+describe('ShareSyncView 选中路径提交保真', () => {
+  function editButtonOf(name: string): HTMLElement {
+    const card = Array.from(document.body.querySelectorAll<HTMLElement>('.config-card'))
+        .find((el) => el.textContent?.includes(name))
+    const btn = Array.from((card ?? document.body).querySelectorAll<HTMLElement>('button'))
+        .find((b) => b.textContent?.trim() === '编辑')
+    expect(btn, `「${name}」应有编辑按钮`).toBeTruthy()
+    return btn!
+  }
+
+  function saveButton(): HTMLElement {
+    const btn = Array.from(document.body.querySelectorAll<HTMLElement>('button'))
+        .find((b) => b.textContent?.trim() === '保存')
+    expect(btn, '应有「保存」按钮').toBeTruthy()
+    return btn!
+  }
+
+  type EditorSub = Omit<typeof SUB, 'include_paths' | 'exclude_paths' | 'targets'> & {
+    include_paths: string[]
+    exclude_paths: string[]
+    targets: Array<Record<string, unknown>>
+  }
+
+  async function openEditor(sub: EditorSub) {
+    api.listSubscriptions.mockResolvedValue([sub])
+    api.updateSubscription.mockResolvedValue({ ...sub })
+    const wrapper = mountView()
+    await flushPromises()
+    editButtonOf(sub.name).click()
+    await flushPromises()
+    return wrapper
+  }
+
+  it('保存时按原字节保留选中路径的文件名空白', async () => {
+    const withSpaces = {
+      ...SUB,
+      include_paths: ['/剧集/报告. '],
+      exclude_paths: ['/剧集/广告. '],
+    }
+    const wrapper = await openEditor(withSpaces)
+
+    saveButton().click()
+    await flushPromises()
+
+    expect(api.updateSubscription).toHaveBeenCalledTimes(1)
+    const req = api.updateSubscription.mock.calls[0][1] as {
+      include_paths: string[]
+      exclude_paths: string[]
+    }
+    expect(req.include_paths, '同步内容保留文件名结尾空格').toEqual(['/剧集/报告. '])
+    expect(req.exclude_paths, '排除内容保留文件名结尾空格').toEqual(['/剧集/广告. '])
+    wrapper.unmount()
+  })
+
+  it('仅结尾空格不同的两条选中路径都保留，不会被去重成一个', async () => {
+    const pair = {
+      ...SUB,
+      include_paths: ['/剧集/报告.', '/剧集/报告. '],
+      exclude_paths: [],
+    }
+    const wrapper = await openEditor(pair)
+
+    saveButton().click()
+    await flushPromises()
+
+    const req = api.updateSubscription.mock.calls[0][1] as { include_paths: string[] }
+    expect(req.include_paths, '仅结尾空格不同即两个文件，不能去重').toEqual([
+      '/剧集/报告.',
+      '/剧集/报告. ',
+    ])
+    wrapper.unmount()
+  })
+
+  it('选中路径只规整分隔符，手工输入的网盘目标仍按原规则 trim', async () => {
+    const messy = {
+      ...SUB,
+      include_paths: ['/剧集//报告. //'],
+      exclude_paths: ['//剧集/广告. '],
+      targets: [
+        { kind: 'netdisk' as const, remote_path: '/我的资源', save_fs_id: 0 },
+        { kind: 'local' as const, local_path: '/tmp', mode: 'transfer_and_download' as const },
+      ],
+    }
+    const wrapper = await openEditor(messy)
+
+    const netdiskInput = document.body.querySelector<HTMLInputElement>(
+      '.subscription-dialog .target-path input',
+    )!
+    netdiskInput.value = '  /我的资源/同步  '
+    netdiskInput.dispatchEvent(new Event('input'))
+    await flushPromises()
+
+    saveButton().click()
+    await flushPromises()
+
+    const req = api.updateSubscription.mock.calls[0][1] as {
+      include_paths: string[]
+      exclude_paths: string[]
+      targets: Array<Record<string, unknown>>
+    }
+    expect(req.include_paths, '只合并冗余斜杠，文件名空白不动').toEqual(['/剧集/报告. '])
+    expect(req.exclude_paths).toEqual(['/剧集/广告. '])
+    expect(req.targets[0].remote_path, '手工目标路径仍走 trim 归一').toBe('/我的资源/同步')
     wrapper.unmount()
   })
 })

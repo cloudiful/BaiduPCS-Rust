@@ -322,6 +322,19 @@
                     </div>
                   </el-form-item>
 
+                  <el-form-item label="跳过秒传" prop="upload.skip_rapid_upload">
+                    <el-switch
+                        v-model="formData.upload.skip_rapid_upload"
+                        active-text="默认跳过"
+                        inactive-text="先尝试秒传"
+                    />
+                    <div class="form-tip">
+                      同 BaiduPCS-Go v4.0.0 的 <code>--norapid</code>：开启后上传不再整文件计算 MD5、不尝试秒传，直接分片上传（合并时使用服务器返回的分片校验值）。
+                      适合上传网盘里肯定没有的新文件（如自己打包的压缩包），可省去读取整个文件的时间；但相同文件也会重新完整上传。
+                      上传对话框中可对单次上传单独开关；自动备份等未单独指定的上传跟随此设置，修改后对之后开始的任务生效。
+                    </div>
+                  </el-form-item>
+
                   <!-- 分片大小说明（自适应，不可配置） -->
                   <el-alert
                       title="智能分片大小（自动适配）"
@@ -955,6 +968,11 @@
                   </div>
                 </el-card>
 
+                <!-- 消息通知 -->
+                <div id="section-notification">
+                  <NotificationSettingsSection v-model="formData.notification!" />
+                </div>
+
                 <!-- 关于信息 -->
                 <el-card id="section-about" class="setting-card" shadow="hover">
                   <template #header>
@@ -1097,12 +1115,19 @@ import {
 import { getExcludeRuleCapabilities, validateExcludeRules } from '@/api/shareSync'
 import { useConfigStore } from '@/stores/config'
 import type { AppConfig, ProxyType, ProxyRuntimeStatus } from '@/api/config'
-import { getRecommendedConfig, resetToRecommended, getProxyStatus, testProxyConnection } from '@/api/config'
+import {
+  getRecommendedConfig,
+  resetToRecommended,
+  getProxyStatus,
+  testProxyConnection,
+  normalizeNotificationConfig,
+} from '@/api/config'
 import type { UploadConflictStrategy } from '@/api/upload'
 import type { DownloadConflictStrategy } from '@/api/download'
 import { FilePickerModal } from '@/components/FilePicker'
 import AuthSettingsSection from '@/components/settings/AuthSettingsSection.vue'
 import AccountManagementSection from '@/components/settings/AccountManagementSection.vue'
+import NotificationSettingsSection from '@/components/settings/NotificationSettingsSection.vue'
 import BudgetPanel from '@/views/settings/BudgetPanel.vue'
 import ExcludeRuleHelp from '@/components/ExcludeRuleHelp.vue'
 import {
@@ -1303,6 +1328,7 @@ const navItems = [
   { id: 'section-encryption', label: '加密', color: '#f56c6c' },
   { id: 'section-backup', label: '自动备份', color: '#67c23a' },
   { id: 'section-proxy', label: '网络代理', color: '#9b59b6' },
+  { id: 'section-notification', label: '消息通知', color: '#e6a23c' },
   { id: 'section-about', label: '关于', color: '#909399' },
 ]
 
@@ -1438,6 +1464,11 @@ async function loadConfig() {
           normalizeRuleList(formData.value.share_sync.exclude_preset_rules)
       formData.value.share_sync.exclude_regex_preset_rules =
           normalizeRuleList(formData.value.share_sync.exclude_regex_preset_rules)
+    }
+
+    // 初始化消息通知（老后端不返回该段时用默认值）
+    if (formData.value) {
+      formData.value.notification = normalizeNotificationConfig(formData.value.notification)
     }
 
     // 初始化界面偏好（老后端不返回该段时用默认值）
@@ -1586,6 +1617,12 @@ async function handleSave() {
         ElMessage.error('代理端口不能为空')
         return
       }
+    }
+
+    // 消息通知：去掉未填写名称的请求头（后端会拒绝空名称）
+    if (formData.value.notification) {
+      formData.value.notification.webhook.headers =
+          formData.value.notification.webhook.headers.filter((h) => h.name.trim() !== '')
     }
 
     saving.value = true

@@ -15,8 +15,8 @@ use crate::server::extractors::{ensure_client_available, resolve_owner_uid_for_c
 use crate::server::AppState;
 use crate::share_sync::{
     infer_share_root, normalize_pagination, normalize_share_path, CreateShareSubscriptionRequest,
-    CronSchedule, RunItemRecord, RunRecord, ShareSubscription, ShareSyncError, ShareSyncManager,
-    UpdateShareSubscriptionRequest, MIN_POLL_INTERVAL_SECS,
+    CronSchedule, RunItemFacets, RunItemFilter, RunItemRecord, RunRecord, ShareSubscription,
+    ShareSyncError, ShareSyncManager, UpdateShareSubscriptionRequest, MIN_POLL_INTERVAL_SECS,
 };
 
 pub type ApiResult<T> = Result<T, ApiError>;
@@ -153,6 +153,7 @@ pub async fn create_subscription(
 ) -> ApiResult<Json<ApiResponse<ShareSubscription>>> {
     let owner_uid = resolve_owner_uid_for_create(&state, req.uid).await?;
     ensure_client_available(&state, owner_uid).await?;
+    ensure_target_accounts_available(&state, &req.targets, &[]).await?;
     let m = get_manager(&state).await?;
     let mut sub = req.into_subscription();
     sub.owner_uid = owner_uid.raw();
@@ -160,6 +161,36 @@ pub async fn create_subscription(
         Ok(s) => Ok(Json(ApiResponse::success(s))),
         Err(e) => Err(map_share_err(e)),
     }
+}
+
+/// 校验同步目标里显式指定的账号（跨账号保存）都已登录。
+///
+/// 只校验本次新引入的账号：沿用原配置里的账号即使暂时掉线也允许保存其他修改，
+/// 执行时该账号的目标会单独报错。「跟随默认下载账号」在执行时实时解析，不在此校验。
+async fn ensure_target_accounts_available(
+    state: &AppState,
+    targets: &[crate::share_sync::SyncTarget],
+    previous: &[crate::share_sync::SyncTarget],
+) -> Result<(), ApiError> {
+    let known: Vec<u64> = previous
+        .iter()
+        .filter_map(|t| t.explicit_account_uid())
+        .collect();
+    for uid in targets.iter().filter_map(|t| t.explicit_account_uid()) {
+        if known.contains(&uid) {
+            continue;
+        }
+        if ensure_client_available(state, crate::auth::Uid::new(uid))
+            .await
+            .is_err()
+        {
+            return Err(ApiError::BadRequest(format!(
+                "同步目标指定的账号(uid={})未登录或不存在",
+                uid
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// PUT /api/v1/share-sync/subscriptions/:id
@@ -193,6 +224,7 @@ pub async fn update_subscription(
         new_sub.exclude_paths = v;
     }
     if let Some(v) = req.targets {
+        ensure_target_accounts_available(&state, &v, &existing.targets).await?;
         new_sub.targets = v;
     }
     if let Some(v) = req.conflict_strategy {
@@ -339,6 +371,22 @@ pub struct RunsQuery {
 pub struct RunItemsQuery {
     pub page: Option<usize>,
     pub page_size: Option<usize>,
+    /// 按状态筛选（`failed` / `completed` / `skipped` / `in_progress` …；空或 `all` = 不筛选）
+    pub status: Option<String>,
+    /// 按动作筛选（`added` / `modified` / `removed` / `skipped`；空或 `all` = 不筛选）
+    pub action: Option<String>,
+    /// 路径关键字（字面包含匹配）
+    pub q: Option<String>,
+}
+
+impl RunItemsQuery {
+    fn filter(&self) -> RunItemFilter {
+        RunItemFilter::from_query(
+            self.status.as_deref(),
+            self.action.as_deref(),
+            self.q.as_deref(),
+        )
+    }
 }
 
 const RUN_ITEM_DEFAULT_PAGE_SIZE: usize = 100;
@@ -381,13 +429,18 @@ pub async fn get_run(
         .map_err(map_share_err)?
         .ok_or_else(|| err_not_found("运行记录不存在"))?;
     let (page, page_size) = normalize_run_item_pagination(q.page, q.page_size);
+    let filter = q.filter();
     let item_total_count = m
         .persistence()
-        .count_run_items(&id)
+        .count_run_items_filtered(&id, &filter)
         .map_err(map_share_err)?;
     let items = m
         .persistence()
-        .list_run_items_page(&id, page, page_size)
+        .list_run_items_page_filtered(&id, &filter, page, page_size)
+        .map_err(map_share_err)?;
+    let item_facets = m
+        .persistence()
+        .run_item_facets(&id)
         .map_err(map_share_err)?;
     Ok(Json(ApiResponse::success(RunDetailDto {
         run: rec,
@@ -395,6 +448,7 @@ pub async fn get_run(
         item_total_count,
         item_page: page,
         item_page_size: page_size,
+        item_facets,
     })))
 }
 
@@ -403,9 +457,12 @@ pub struct RunDetailDto {
     #[serde(flatten)]
     pub run: RunRecord,
     pub items: Vec<RunItemRecord>,
+    /// 符合筛选条件的条数（未传筛选参数时 = 全部条数，与旧版一致）
     pub item_total_count: usize,
     pub item_page: usize,
     pub item_page_size: usize,
+    /// 整个 run 按状态 / 动作分组计数（不受筛选影响），新增字段
+    pub item_facets: RunItemFacets,
 }
 
 /// GET /api/v1/share-sync/runs/:id/items
@@ -423,28 +480,37 @@ pub async fn list_run_items(
         return Err(err_not_found("运行记录不存在"));
     }
     let (page, page_size) = normalize_run_item_pagination(q.page, q.page_size);
+    let filter = q.filter();
     let total = m
         .persistence()
-        .count_run_items(&id)
+        .count_run_items_filtered(&id, &filter)
         .map_err(map_share_err)?;
     let items = m
         .persistence()
-        .list_run_items_page(&id, page, page_size)
+        .list_run_items_page_filtered(&id, &filter, page, page_size)
+        .map_err(map_share_err)?;
+    let facets = m
+        .persistence()
+        .run_item_facets(&id)
         .map_err(map_share_err)?;
     Ok(Json(ApiResponse::success(RunItemsPageDto {
         items,
         total,
         page,
         page_size,
+        facets,
     })))
 }
 
 #[derive(Debug, Serialize)]
 pub struct RunItemsPageDto {
     pub items: Vec<RunItemRecord>,
+    /// 符合筛选条件的条数
     pub total: usize,
     pub page: usize,
     pub page_size: usize,
+    /// 整个 run 按状态 / 动作分组计数（不受筛选影响），新增字段
+    pub facets: RunItemFacets,
 }
 
 /// GET /api/v1/share-sync/subscriptions/:id/subtasks
@@ -1073,5 +1139,41 @@ mod exclude_rule_endpoint_tests {
         let r = validate(&[], &[".*"], Some("/任何/路径")).await;
         assert!(r.valid);
         assert_eq!(r.excluded, Some(true));
+    }
+}
+
+#[cfg(test)]
+mod run_items_query_tests {
+    use super::*;
+    use axum::extract::Query;
+    use axum::http::Uri;
+
+    fn parse(qs: &str) -> RunItemsQuery {
+        let uri: Uri = format!("/api/v1/share-sync/runs/r/items?{qs}")
+            .parse()
+            .unwrap();
+        Query::<RunItemsQuery>::try_from_uri(&uri).unwrap().0
+    }
+
+    #[test]
+    fn legacy_query_without_filters_means_no_filter() {
+        let q = parse("page=2&page_size=100");
+        assert_eq!((q.page, q.page_size), (Some(2), Some(100)));
+        assert_eq!(q.filter(), RunItemFilter::default());
+    }
+
+    #[test]
+    fn filter_params_are_parsed_and_all_is_ignored() {
+        let q = parse("page=1&status=failed&action=modified&q=%E8%A7%86%E9%A2%91");
+        assert_eq!(
+            q.filter(),
+            RunItemFilter {
+                status: Some("failed".into()),
+                action: Some("modified".into()),
+                keyword: Some("视频".into()),
+            }
+        );
+        let q = parse("status=all&action=&q=");
+        assert_eq!(q.filter(), RunItemFilter::default());
     }
 }
