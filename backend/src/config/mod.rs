@@ -75,6 +75,9 @@ pub struct AppConfig {
     /// 界面偏好配置（仅前端使用，后端只负责持久化）
     #[serde(default)]
     pub ui: UiConfig,
+    /// 消息通知配置（Gotify / 通用 Webhook）；老配置缺该段时默认关闭
+    #[serde(default)]
+    pub notification: crate::notification::NotificationConfig,
 }
 
 // ============================================================================
@@ -831,6 +834,12 @@ pub struct UploadConfig {
     /// 最近使用的上传源目录
     #[serde(default)]
     pub recent_directory: Option<PathBuf>,
+    /// 默认跳过秒传（对应 BaiduPCS-Go v4.0.0 `upload --norapid`）
+    ///
+    /// 开启后不再整文件计算分片 MD5、也不尝试秒传，直接分片上传；适合确定是全新的
+    /// 文件（如自己打的压缩包）。单次上传可在请求里用 `skip_rapid_upload` 覆盖。
+    #[serde(default)]
+    pub skip_rapid_upload: bool,
 }
 
 impl Default for UploadConfig {
@@ -842,6 +851,7 @@ impl Default for UploadConfig {
             max_retries: 3,
             skip_hidden_files: false, // 默认不跳过隐藏文件
             recent_directory: None,   // 默认无最近目录
+            skip_rapid_upload: false, // 默认先尝试秒传
         }
     }
 }
@@ -1354,6 +1364,7 @@ impl Default for AppConfig {
             multi_account_vip_recommended: MultiAccountVipRecommendedConfig::default(),
             share_sync: ShareSyncConfig::default(),
             ui: UiConfig::default(),
+            notification: crate::notification::NotificationConfig::default(),
         }
     }
 }
@@ -1565,6 +1576,20 @@ impl AppConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_upload_skip_rapid_upload_defaults_false() {
+        assert!(!UploadConfig::default().skip_rapid_upload);
+        // 旧配置文件没有该字段 → 默认 false（先尝试秒传，行为不变）
+        let mut v = serde_json::to_value(UploadConfig::default()).unwrap();
+        v.as_object_mut().unwrap().remove("skip_rapid_upload");
+        let cfg: UploadConfig = serde_json::from_value(v).unwrap();
+        assert!(!cfg.skip_rapid_upload);
+        let mut v = serde_json::to_value(UploadConfig::default()).unwrap();
+        v["skip_rapid_upload"] = serde_json::Value::Bool(true);
+        let cfg: UploadConfig = serde_json::from_value(v).unwrap();
+        assert!(cfg.skip_rapid_upload);
+    }
 
     #[tokio::test]
     async fn test_default_config() {

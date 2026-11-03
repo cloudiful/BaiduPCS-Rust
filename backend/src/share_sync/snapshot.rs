@@ -375,6 +375,23 @@ impl<'a> SnapshotCollector<'a> {
         })
     }
 
+    /// 仅访问分享页（+ 验证提取码）得到的转存上下文，不列目录。
+    ///
+    /// 跨账号转存时用目标账号的客户端调用 `from_url` 再取它：`bdstoken` 是账号级的，
+    /// 不能沿用扫描账号抓到的那份。
+    pub fn captured_share(&self) -> CapturedShare {
+        CapturedShare {
+            short_key: self.short_key.clone(),
+            shareid: self.shareid.clone(),
+            uk: self.uk.clone(),
+            share_uk: self.share_uk.clone(),
+            bdstoken: self.bdstoken.clone(),
+            kind: self.kind,
+            password: self.password.clone(),
+            randsk: self.randsk.clone(),
+        }
+    }
+
     /// 注入扫描进度回调（每列完一个目录调用一次；调用方负责节流）
     pub fn with_progress(mut self, sink: ScanProgressSink) -> Self {
         self.progress = Some(sink);
@@ -408,12 +425,7 @@ impl<'a> SnapshotCollector<'a> {
                 self.rate_limiter.acquire().await;
                 let r = self
                     .client
-                    .list_share_files_for(
-                        &self.share_info(),
-                        1,
-                        page_size,
-                        self.randsk.as_deref(),
-                    )
+                    .list_share_files_for(&self.share_info(), 1, page_size, self.randsk.as_deref())
                     .await
                     // 用 `{:#}` 保留完整 anyhow 错误链（含底层超时/百度 errno+errmsg），
                     // 否则 `to_string()` 只取最外层 context，排障时看不到百度到底返回了什么。
@@ -555,13 +567,7 @@ impl<'a> SnapshotCollector<'a> {
             loop {
                 self.check_cancelled()?;
                 let batch = self
-                    .list_dir_page_with_retry(
-                        &root_shareid,
-                        &root_uk,
-                        &dir,
-                        page,
-                        page_size,
-                    )
+                    .list_dir_page_with_retry(&root_shareid, &root_uk, &dir, page, page_size)
                     .await?;
 
                 if batch.is_empty() {
@@ -808,16 +814,17 @@ pub fn cancelled_error(cancel: Option<&CancellationToken>) -> Result<(), ShareSy
     Ok(())
 }
 
-/// 排除规则集合：精确目录路径（`exclude_paths`）+ glob / 正则模式。
+/// 排除规则集合：精确路径（`exclude_paths`，文件或目录）+ glob / 正则模式。
 ///
 /// 三类规则的语义：
-/// - **精确路径**：命中的目录连同其中全部内容一起排除，且扫描时不再列举该目录。
+/// - **精确路径**：命中的**文件**只排除自身；命中的**目录**连同其中全部内容一起排除，
+///   且扫描时不再列举该目录。
 /// - **glob / 正则**：路径命中即排除；**目录**命中时其整棵子树一起排除。
 ///
 /// 精确路径的匹配是**边界感知**的：`/a/b` 不会误伤同层的 `/a/bc`。
 #[derive(Debug, Default, Clone)]
 pub struct ExclusionRules {
-    /// 精确排除的目录路径（相对分享根）
+    /// 精确排除的文件或目录路径（相对分享根）
     exact_paths: BTreeSet<String>,
     /// 预编译的 glob + 正则规则
     rules: CompiledRules,
@@ -866,7 +873,9 @@ impl ExclusionRules {
         self.exact_hit(dir) || self.pattern_hit(dir)
     }
 
-    /// 该条目是否应被排除
+    /// 该条目是否应被排除。
+    ///
+    /// 精确路径命中**文件**时只排除该文件本身；命中**目录**时整棵子树都不再出现。
     pub fn excludes_item(&self, path: &str, is_dir: bool) -> bool {
         if is_dir {
             return self.excludes_dir(path);
@@ -877,7 +886,8 @@ impl ExclusionRules {
     /// 把精确排除路径归一到「相对分享根」命名空间（与快照条目 path 对齐）。
     ///
     /// 用户挑的可能是分享内绝对路径或 sharelink 合成路径；不归一时非根分享
-    /// （分享根是某个目录）的排除规则匹配不到任何条目。
+    /// （分享根是某个目录）的排除规则匹配不到任何条目。sharelink 合成前缀会被剥离，
+    /// 因此 `sharelink0-<id>` 与真实 uk 两种写法命中同一份内容。
     fn remap_exact_paths(&mut self, share_root: &str) {
         if self.exact_paths.is_empty() {
             return;
@@ -936,12 +946,14 @@ pub fn normalize_share_path(raw_path: &str, name: &str, share_root: &str) -> Str
         raw.trim_start_matches('/').to_string()
     };
 
-    let fallback = if name.trim().is_empty() {
+    // 文件名里的空白同样是内容（如结尾空格），不能当作格式噪声 trim 掉；
+    // 只有真正缺失的名字才回退到 raw 的最后一段。
+    let fallback = if name.is_empty() {
         raw.rsplit('/').next().unwrap_or("").to_string()
     } else {
-        name.trim().to_string()
+        name.to_string()
     };
-    let candidate = if relative.trim().is_empty() {
+    let candidate = if relative.is_empty() {
         fallback
     } else {
         relative
@@ -950,15 +962,26 @@ pub fn normalize_share_path(raw_path: &str, name: &str, share_root: &str) -> Str
     normalize_snapshot_path(candidate).unwrap_or_else(|| "/".to_string())
 }
 
+/// 只规整分隔符冗余（反斜杠、重复斜杠、首尾斜杠），**不裁剪文件名里的空白**。
+///
+/// 根分隔符之前的空白只算分隔符填充，不属于任何文件名；分隔符之后的空白属于
+/// 文件名本身（如结尾空格），必须逐字节保留，否则「报告. 」会与「报告.」归一成
+/// 同一路径，来源与排除都会串到同名文件上。
 fn normalize_snapshot_path(path: String) -> Option<String> {
-    let trimmed = path.trim().replace('\\', "/");
-    if trimmed.is_empty() {
+    let normalized = path.replace('\\', "/");
+    if normalized.is_empty() {
         return None;
     }
-    let prefixed = if trimmed.starts_with('/') {
-        trimmed
+    let trimmed_start = normalized.trim_start();
+    let normalized = if trimmed_start.starts_with('/') {
+        trimmed_start.to_string()
     } else {
-        format!("/{}", trimmed)
+        normalized
+    };
+    let prefixed = if normalized.starts_with('/') {
+        normalized
+    } else {
+        format!("/{}", normalized)
     };
     let mut collapsed = String::with_capacity(prefixed.len());
     let mut prev_slash = false;
@@ -1484,8 +1507,14 @@ mod tests {
         for (dir, why) in [
             ("/大主宰3D", "含被排除的 S01 与深层内容"),
             ("/大主宰3D/S02 连载中", "含深层被排除内容"),
-            ("/大主宰3D/S02 连载中/S02 4K NoSub", "直接含被排除的 Soft/zip"),
-            ("/大主宰3D/S02 连载中/S02 4K NoSub/字幕文件", "全部子项被排除"),
+            (
+                "/大主宰3D/S02 连载中/S02 4K NoSub",
+                "直接含被排除的 Soft/zip",
+            ),
+            (
+                "/大主宰3D/S02 连载中/S02 4K NoSub/字幕文件",
+                "全部子项被排除",
+            ),
         ] {
             let d = by_path
                 .get(dir)
@@ -1651,7 +1680,12 @@ mod tests {
     fn test_remap_include_absolute_path_to_share_root() {
         // 用户实际场景：分享根是单个目录 scan_test，分享内真实路径
         // /13/a测试上传1/scan_test；前端按根级勾选把真实绝对路径存进 include。
-        let files = vec![shared_file("/13/a测试上传1/scan_test", "scan_test", 1, true)];
+        let files = vec![shared_file(
+            "/13/a测试上传1/scan_test",
+            "scan_test",
+            1,
+            true,
+        )];
         let share_root = infer_share_root(&files);
         assert_eq!(share_root, "/13/a测试上传1");
 
@@ -1966,7 +2000,135 @@ mod tests {
             normalize_snapshot_path("   /bar//".to_string()),
             Some("/bar".to_string())
         );
+        assert_eq!(
+            normalize_snapshot_path("/剧集/报告. ".to_string()),
+            Some("/剧集/报告. ".to_string())
+        );
+        assert_eq!(
+            normalize_snapshot_path("/剧集//报告. //".to_string()),
+            Some("/剧集/报告. ".to_string())
+        );
         assert_eq!(normalize_snapshot_path("".to_string()), None);
+    }
+
+    /// 文件名空白是内容而不是格式噪声：只有分隔符冗余被规整，尾随空格必须原样保留，
+    /// 否则「报告. 」与「报告.」会归一成同一路径，来源与排除都会串到同名文件上。
+    #[test]
+    fn test_normalize_snapshot_path_preserves_filename_whitespace() {
+        assert_ne!(
+            normalize_snapshot_path("/剧集/报告. ".to_string()),
+            normalize_snapshot_path("/剧集/报告.".to_string())
+        );
+        assert_eq!(
+            normalize_snapshot_path("/剧集/报告.  ".to_string()),
+            Some("/剧集/报告.  ".to_string())
+        );
+        assert_eq!(
+            normalize_snapshot_path("/剧集/第 1 集.mp4".to_string()),
+            Some("/剧集/第 1 集.mp4".to_string())
+        );
+        // 根分隔符之前的空白只算分隔符填充，不进文件名
+        assert_eq!(
+            normalize_snapshot_path("  /剧集/报告. ".to_string()),
+            Some("/剧集/报告. ".to_string())
+        );
+    }
+
+    /// `normalize_share_path` 不能把空白文件名当成「名字缺失」去回退或 trim。
+    #[test]
+    fn test_normalize_share_path_preserves_name_whitespace() {
+        assert_eq!(
+            normalize_share_path("/剧集/报告. ", "报告. ", "/"),
+            "/剧集/报告. "
+        );
+        assert_eq!(
+            normalize_share_path("/剧集/报告.", "报告.", "/"),
+            "/剧集/报告."
+        );
+        // 空白名字不是空名字：不回退到 raw 末段，也不被裁掉
+        assert_eq!(normalize_share_path("/", " ", "/"), "/ ");
+        // 空名字仍回退到 raw 的最后一段，空路径仍回退到根
+        assert_eq!(
+            normalize_share_path("/剧集/报告. ", "", "/剧集"),
+            "/报告. "
+        );
+        assert_eq!(normalize_share_path("", "", "/"), "/");
+    }
+
+    /// 精确排除必须区分尾随空格：只排除被选中的那一个字面名，不牵连同名兄弟。
+    #[test]
+    fn test_exact_exclusion_distinguishes_trailing_space_filename() {
+        let rules = ExclusionRules::compile(vec!["/剧集/报告. ".to_string()], &[], &[])
+            .expect("精确排除编译不应失败");
+        assert!(rules.excludes_item("/剧集/报告. ", false));
+        assert!(
+            !rules.excludes_item("/剧集/报告.", false),
+            "无空格同名文件不得被连带排除"
+        );
+        assert!(
+            !rules.excludes_item("/剧集/报告.  ", false),
+            "空格数不同的文件不得被连带排除"
+        );
+    }
+
+    /// 深层目录里显式排除一个尾随空格文件：仅该文件消失，兄弟存活，祖先标 pruned。
+    #[test]
+    fn test_trailing_space_file_exclusion_prunes_only_itself() {
+        let includes = BTreeSet::new();
+        let index = build_include_index(&includes);
+        let all_items = vec![
+            dir_item("/剧集", 1),
+            dir_item("/剧集/子目录", 2),
+            item("/剧集/子目录/报告. ", 21, 100),
+            item("/剧集/子目录/报告.", 22, 100),
+            item("/剧集/子目录/报告.  ", 23, 100),
+            item("/剧集/子目录/其他.txt", 24, 100),
+        ];
+
+        let out = filter_and_mark_pruned(
+            all_items,
+            &includes,
+            &index,
+            &exclusions(&["/剧集/子目录/报告. "], &[]),
+        );
+        let by_path: BTreeMap<&str, &ShareSnapshotItem> =
+            out.iter().map(|i| (i.path.as_str(), i)).collect();
+
+        assert!(
+            !by_path.contains_key("/剧集/子目录/报告. "),
+            "被排除的尾随空格文件不得存活"
+        );
+        assert!(by_path.contains_key("/剧集/子目录/报告."), "无空格同名文件必须存活");
+        assert!(
+            by_path.contains_key("/剧集/子目录/报告.  "),
+            "空格数不同的文件必须存活"
+        );
+        assert!(by_path.contains_key("/剧集/子目录/其他.txt"));
+        assert!(
+            by_path.get("/剧集/子目录").unwrap().subtree_pruned,
+            "父目录必须标 subtree_pruned"
+        );
+        assert!(
+            by_path.get("/剧集").unwrap().subtree_pruned,
+            "祖先目录同样必须标 subtree_pruned"
+        );
+    }
+
+    /// 选中一个尾随空格文件作为 include：只采集该条目，不把同名无空格文件带进来。
+    #[test]
+    fn test_include_path_with_trailing_space_matches_only_that_item() {
+        let includes: BTreeSet<String> = ["/剧集/报告. ".to_string()].into_iter().collect();
+        let index = build_include_index(&includes);
+        let all_items = vec![
+            dir_item("/剧集", 1),
+            item("/剧集/报告. ", 21, 100),
+            item("/剧集/报告.", 22, 100),
+            item("/剧集/其他.txt", 23, 100),
+        ];
+
+        let out = filter_and_mark_pruned(all_items, &includes, &index, &no_exclusions());
+        let paths: Vec<&str> = out.iter().map(|i| i.path.as_str()).collect();
+        assert_eq!(paths, vec!["/剧集", "/剧集/报告. "]);
     }
 
     // ========== 精确目录排除 / glob 子树排除 ==========
@@ -2035,6 +2197,56 @@ mod tests {
         // 文件同样按「是否位于被排除目录之下」判定
         assert!(rules.excludes_item("/剧集/S01/第1集.mp4", false));
         assert!(!rules.excludes_item("/剧集/S01x.mp4", false));
+    }
+
+    /// 精确排除**文件**时只排除该文件本身：同目录兄弟文件与各级目录都不受影响。
+    #[test]
+    fn test_exact_excluded_file_excludes_only_itself() {
+        let rules = exclusions(&["/剧集/S01/第1集.mp4"], &[]);
+        assert!(rules.excludes_item("/剧集/S01/第1集.mp4", false));
+        assert!(
+            !rules.excludes_item("/剧集/S01/第2集.mp4", false),
+            "兄弟文件不得被连带排除"
+        );
+        assert!(!rules.excludes_dir("/剧集/S01"), "上级目录不得被剪掉");
+        assert!(!rules.excludes_dir("/剧集"));
+    }
+
+    /// 精确排除文件后：文件从快照消失、兄弟文件存活，父目录必须标 subtree_pruned
+    /// —— 否则转存阶段会把父目录当作单个 fs_id 整体直传，把被排除的文件原样带过去。
+    #[test]
+    fn test_exact_excluded_file_absent_and_sibling_survives() {
+        let includes = BTreeSet::new();
+        let index = build_include_index(&includes);
+        let all_items = vec![
+            dir_item("/剧集", 1),
+            dir_item("/剧集/S01", 2),
+            item("/剧集/S01/第1集.mp4", 21, 100),
+            item("/剧集/S01/第2集.mp4", 22, 100),
+        ];
+
+        let out = filter_and_mark_pruned(
+            all_items,
+            &includes,
+            &index,
+            &exclusions(&["/剧集/S01/第1集.mp4"], &[]),
+        );
+        let by_path: BTreeMap<&str, &ShareSnapshotItem> =
+            out.iter().map(|i| (i.path.as_str(), i)).collect();
+
+        assert!(
+            !by_path.contains_key("/剧集/S01/第1集.mp4"),
+            "被排除的文件不得存活"
+        );
+        assert!(
+            by_path.contains_key("/剧集/S01/第2集.mp4"),
+            "兄弟文件必须存活"
+        );
+        assert!(by_path.contains_key("/剧集/S01"), "父目录必须存活");
+        assert!(
+            by_path.get("/剧集/S01").unwrap().subtree_pruned,
+            "父目录必须标 subtree_pruned，禁止整目录直传"
+        );
     }
 
     /// 被排除目录及其后代不得出现在快照里，且**存活的祖先目录必须标 subtree_pruned** ——
@@ -2108,6 +2320,28 @@ mod tests {
         assert!(rules.excludes_dir("/scan_test/广告"));
         assert!(rules.excludes_dir("/scan_test/广告/x.mp4"));
         assert!(!rules.excludes_dir("/scan_test"));
+    }
+
+    /// sharelink 合成前缀的排除路径同样归一到分享根命名空间：`sharelink0-<id>` 与
+    /// 真实 uk 两种写法命中同一份内容（前端按别名回填，语义必须一致）。
+    #[test]
+    fn test_exclude_paths_alias_remapped_to_share_root() {
+        for alias in [
+            "/sharelink0-6168417644/scan_test/广告",
+            "/sharelink1100862997704-6168417644/scan_test/广告",
+        ] {
+            let mut rules = exclusions(&[alias], &[]);
+            rules.remap_exact_paths("/13/a测试上传1");
+            assert!(
+                rules.excludes_dir("/scan_test/广告"),
+                "别名写法未命中: {alias}"
+            );
+            assert!(
+                rules.excludes_item("/scan_test/广告/贴片.mp4", false),
+                "别名写法未覆盖后代: {alias}"
+            );
+            assert!(!rules.excludes_dir("/scan_test"), "别名写法误伤上级: {alias}");
+        }
     }
 
     /// 取消令牌被触发后，扫描立刻返回「已取消」而不是继续跑。

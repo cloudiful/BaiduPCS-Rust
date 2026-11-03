@@ -22,6 +22,11 @@ export interface NetdiskTarget {
   remote_path: string
   save_fs_id: number
   conflict_strategy?: ConflictStrategy | null
+  /**
+   * 转存到哪个账号的网盘（跨账号保存 / 多账号归集）。
+   * 缺省或 null = 订阅所属账号（兼容老订阅）。同一订阅里每个账号最多 1 个网盘目标。
+   */
+  account_uid?: number | null
 }
 
 export interface LocalTarget {
@@ -30,6 +35,13 @@ export interface LocalTarget {
   conflict_strategy?: ConflictStrategy | null
   /** 本地同步模式；缺省时后端按 `share_direct` 反序列化（兼容老订阅） */
   mode?: LocalSyncMode
+  /**
+   * 用哪个账号下载到本地（如「小号留底 + VIP 大号下载」）。
+   * 缺省或 null = 订阅所属账号；`use_default_download_account` 为 true 时忽略本字段。
+   */
+  download_uid?: number | null
+  /** 跟随全局「默认下载账号」（运行时解析；未设置时回退订阅所属账号） */
+  use_default_download_account?: boolean
 }
 
 export type SyncTarget = NetdiskTarget | LocalTarget
@@ -65,7 +77,7 @@ export interface ShareSubscription {
   exclude_patterns: string[]
   /** 排除正则（Rust 语法，整条路径匹配）；旧响应可能缺该字段 */
   exclude_regex_patterns?: string[]
-  /** 精确排除的目录路径（相对分享根）；命中的目录连同其中全部内容一起排除 */
+  /** 精确排除的文件或目录路径（相对分享根）；文件只排除自身，目录连同全部内容排除 */
   exclude_paths: string[]
   targets: SyncTarget[]
   conflict_strategy: ConflictStrategy
@@ -92,7 +104,7 @@ export interface CreateShareSubscriptionRequest {
   exclude_patterns?: string[]
   /** 排除正则（Rust 语法，整条路径匹配） */
   exclude_regex_patterns?: string[]
-  /** 精确排除的目录路径（相对分享根） */
+  /** 精确排除的文件或目录路径（相对分享根）；文件只排除自身，目录连同全部内容排除 */
   exclude_paths?: string[]
   targets: SyncTarget[]
   conflict_strategy?: ConflictStrategy
@@ -110,7 +122,7 @@ export interface UpdateShareSubscriptionRequest {
   exclude_patterns?: string[]
   /** 缺省 = 保留已存正则；显式 [] = 清空 */
   exclude_regex_patterns?: string[]
-  /** 精确排除的目录路径（相对分享根） */
+  /** 精确排除的文件或目录路径（相对分享根）；文件只排除自身，目录连同全部内容排除 */
   exclude_paths?: string[]
   targets?: SyncTarget[]
   conflict_strategy?: ConflictStrategy
@@ -176,16 +188,49 @@ export interface RunDetail {
   /** 运行中 run 的当前阶段（后端 RunDetailDto 用 serde flatten 透传 RunRecord 的字段） */
   phase?: RunPhase | string | null
   items: RunItemRecord[]
+  /** 符合筛选条件的条数（未筛选时 = 全部条数） */
   item_total_count: number
   item_page: number
   item_page_size: number
+  /** 整个 run 按状态 / 动作分组计数（不受筛选影响）；老后端不返回 */
+  item_facets?: RunItemFacets
+}
+
+/** 运行详情「文件动作」分组计数：键为后端 status / action 原值 */
+export interface RunItemFacets {
+  status_counts: Record<string, number>
+  action_counts: Record<string, number>
+}
+
+/**
+ * 运行详情「文件动作」服务端筛选条件。字段为空 / 'all' 表示不筛选。
+ * status 除后端原值外还支持分组值 'in_progress'（等待 / 转存中 / 下载中 / 删除中）。
+ */
+export interface RunItemFilter {
+  status?: string
+  action?: string
+  /** 路径关键字（字面包含匹配，不区分大小写） */
+  q?: string
 }
 
 export interface RunItemsPage {
   items: RunItemRecord[]
+  /** 符合筛选条件的条数 */
   total: number
   page: number
   page_size: number
+  /** 老后端不返回 */
+  facets?: RunItemFacets
+}
+
+/** 只把有效筛选条件放进查询参数，未筛选时请求与旧版完全一致 */
+function runItemFilterParams(filter?: RunItemFilter): Record<string, string> {
+  const out: Record<string, string> = {}
+  if (filter?.status && filter.status !== 'all') out.status = filter.status
+  if (filter?.action && filter.action !== 'all') out.action = filter.action
+  const q = filter?.q?.trim()
+  if (q) out.q = q
+  return out
 }
 
 export interface ShareSnapshotItem {
@@ -378,16 +423,21 @@ export async function listRuns(id: string, page = 1, pageSize = 20): Promise<Run
   return r.data.data
 }
 
-export async function getRun(runId: string, page = 1, pageSize = 100): Promise<RunDetail> {
+export async function getRun(runId: string, page = 1, pageSize = 100, filter?: RunItemFilter): Promise<RunDetail> {
   const r = await rawApiClient.get<{ success: boolean; data: RunDetail }>(`${BASE}/runs/${runId}`, {
-    params: { page, page_size: pageSize }
+    params: { page, page_size: pageSize, ...runItemFilterParams(filter) }
   })
   return r.data.data
 }
 
-export async function listRunItems(runId: string, page = 1, pageSize = 100): Promise<RunItemsPage> {
+export async function listRunItems(
+  runId: string,
+  page = 1,
+  pageSize = 100,
+  filter?: RunItemFilter,
+): Promise<RunItemsPage> {
   const r = await rawApiClient.get<{ success: boolean; data: RunItemsPage }>(`${BASE}/runs/${runId}/items`, {
-    params: { page, page_size: pageSize }
+    params: { page, page_size: pageSize, ...runItemFilterParams(filter) }
   })
   return r.data.data
 }
@@ -511,7 +561,7 @@ export async function getExcludeRuleCapabilities(): Promise<ExcludeRuleCapabilit
 /**
  * 校验排除规则，可选对一条相对分享根路径试匹配。
  *
- * 只覆盖请求里的两份规则列表（不含同步范围与精确排除目录）；规则非法时
+ * 只覆盖请求里的两份规则列表（不含同步范围与精确排除内容）；规则非法时
  * `valid:false` 且后端不会执行匹配。
  */
 export async function validateExcludeRules(

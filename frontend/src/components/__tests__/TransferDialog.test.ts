@@ -52,8 +52,11 @@ vi.mock('@/api/shareSync', () => ({
   validateExcludeRules: shareSync.validateRules,
 }))
 
+// 可变的 auth 桩：跨账号用例打开多账号
+const authState = vi.hoisted(() => ({ activeUid: 1, hasMultipleAccounts: false }))
+
 vi.mock('@/stores/auth', () => ({
-  useAuthStore: () => ({ activeUid: 1 }),
+  useAuthStore: () => authState,
 }))
 
 vi.mock('@/utils/responsive', () => ({
@@ -62,10 +65,10 @@ vi.mock('@/utils/responsive', () => ({
 
 const TARGET_ITEM = { fs_id: 1, is_dir: false, path: '/a.txt', size: 10, name: 'a.txt' }
 
-async function mountDialog() {
+async function mountDialog(lockKeepSync = true) {
   // 先关闭再打开，触发 el-dialog 的 open 钩子（handleOpen 初始化表单与 keepSync）
   const wrapper = mount(TransferDialog, {
-    props: { modelValue: false, lockKeepSync: true },
+    props: { modelValue: false, lockKeepSync },
     attachTo: document.body,
     global: {
       plugins: [ElementPlus],
@@ -74,6 +77,13 @@ async function mountDialog() {
         ShareFileSelector: true,
         CronExprEditor: true,
         FilePickerModal: true,
+        // 账号选择桩：点击切到 uid=2
+        AccountSelect: {
+          name: 'AccountSelect',
+          props: ['modelValue'],
+          emits: ['update:modelValue'],
+          template: `<button class="pick-account-2" @click="$emit('update:modelValue', 2)">acc-{{ modelValue }}</button>`,
+        },
         // 编辑器桩：暴露 validateRules，并提供按钮触发正则模型更新
         ShareIncludeExcludeEditor: {
           name: 'ShareIncludeExcludeEditor',
@@ -86,6 +96,7 @@ async function mountDialog() {
             <div class="editor-stub">
               <button class="emit-regex" @click="$emit('update:excludeRegexPatterns', ['^/股票/按月归档/2025.*$'])">set-regex</button>
               <button class="emit-glob" @click="$emit('update:excludePatterns', ['*.tmp'])">set-glob</button>
+              <button class="emit-selected-paths" @click="$emit('update:includePaths', ['/剧集/报告. ', '/剧集/报告.']); $emit('update:excludePaths', ['/剧集/广告. '])">set-paths</button>
             </div>
           `,
           setup(_props: unknown, { expose }: { expose: (e: Record<string, unknown>) => void }) {
@@ -115,6 +126,9 @@ function createButton(): HTMLButtonElement {
 }
 
 beforeEach(() => {
+  authState.activeUid = 1
+  authState.hasMultipleAccounts = false
+  transfer.createTransfer.mockReset().mockResolvedValue({ task_id: 'task-1' })
   config.getTransferConfig.mockReset().mockResolvedValue({
     recent_save_path: '/我的资源',
     recent_save_fs_id: 0,
@@ -158,6 +172,31 @@ describe('TransferDialog 订阅创建与正则排除', () => {
     }
     expect(req.exclude_patterns).toEqual(['*.tmp'])
     expect(req.exclude_regex_patterns).toEqual(['^/股票/按月归档/2025.*$'])
+    wrapper.unmount()
+  })
+
+  it('选中路径原样提交：文件名尾随空格不被创建请求裁掉', async () => {
+    const wrapper = await mountDialog()
+    await flushPromises()
+
+    shareUrlInput().value = 'https://pan.baidu.com/s/1y7CluAbCdEfGh'
+    shareUrlInput().dispatchEvent(new Event('input'))
+    await flushPromises()
+
+    document.body.querySelector<HTMLElement>('.emit-selected-paths')!.click()
+    await flushPromises()
+
+    createButton().click()
+    await flushPromises()
+
+    expect(shareSync.createSubscription).toHaveBeenCalledTimes(1)
+    const req = shareSync.createSubscription.mock.calls[0][0] as {
+      include_paths: string[]
+      exclude_paths: string[]
+    }
+    // 编辑器产物必须按原字节进入请求：只有空格不同的两个文件不能被去重或 trim
+    expect(req.include_paths).toEqual(['/剧集/报告. ', '/剧集/报告.'])
+    expect(req.exclude_paths).toEqual(['/剧集/广告. '])
     wrapper.unmount()
   })
 
@@ -222,6 +261,100 @@ describe('TransferDialog 订阅创建与正则排除', () => {
       exclude_regex_patterns: string[]
     }
     expect(req.exclude_regex_patterns, '重开不得残留上次的正则').toEqual([])
+    wrapper.unmount()
+  })
+})
+
+describe('TransferDialog 跨账号保存', () => {
+  function findButton(text: string): HTMLButtonElement {
+    const btn = Array.from(document.body.querySelectorAll<HTMLButtonElement>('button'))
+        .find((b) => b.textContent?.trim() === text)
+    expect(btn, `应有「${text}」按钮`).toBeTruthy()
+    return btn!
+  }
+
+  it('单账号时不显示目标账号选择，订阅归属活跃账号', async () => {
+    const wrapper = await mountDialog()
+    expect(document.body.querySelector('.pick-account-2')).toBeNull()
+    shareUrlInput().value = 'https://pan.baidu.com/s/1y7CluAbCdEfGh'
+    shareUrlInput().dispatchEvent(new Event('input'))
+    await flushPromises()
+    createButton().click()
+    await flushPromises()
+    const req = shareSync.createSubscription.mock.calls[0][0] as { owner_uid?: number }
+    expect(req.owner_uid).toBe(1)
+    wrapper.unmount()
+  })
+
+  it('选择其他账号后订阅归属该账号，目录选择器浏览该账号且保存位置重置为根目录', async () => {
+    authState.hasMultipleAccounts = true
+    config.getTransferConfig.mockResolvedValue({
+      recent_save_path: '/我的资源',
+      recent_save_fs_id: 42,
+      default_behavior: 'transfer_only',
+    })
+    const wrapper = await mountDialog()
+    const selector = wrapper.findComponent({ name: 'NetdiskPathSelector' })
+    expect(selector.props('modelValue')).toBe('/我的资源')
+
+    document.body.querySelector<HTMLElement>('.pick-account-2')!.click()
+    await flushPromises()
+
+    const selectorAfter = wrapper.findComponent({ name: 'NetdiskPathSelector' })
+    expect(selectorAfter.props('uid')).toBe(2)
+    expect(selectorAfter.props('modelValue'), '最近目录属于活跃账号，跨账号应回到根目录').toBe('/')
+    expect(wrapper.findComponent({ name: 'ShareIncludeExcludeEditor' }).props('ownerUid')).toBe(2)
+
+    shareUrlInput().value = 'https://pan.baidu.com/s/1y7CluAbCdEfGh'
+    shareUrlInput().dispatchEvent(new Event('input'))
+    await flushPromises()
+    createButton().click()
+    await flushPromises()
+    const req = shareSync.createSubscription.mock.calls[0][0] as {
+      owner_uid?: number
+      targets: { kind: string; remote_path?: string }[]
+    }
+    expect(req.owner_uid).toBe(2)
+    expect(req.targets[0]).toMatchObject({ kind: 'netdisk', remote_path: '/' })
+    wrapper.unmount()
+  })
+
+  it('一次性转存带上目标账号 owner_uid', async () => {
+    authState.hasMultipleAccounts = true
+    const wrapper = await mountDialog(false)
+    document.body.querySelector<HTMLElement>('.pick-account-2')!.click()
+    await flushPromises()
+
+    shareUrlInput().value = 'https://pan.baidu.com/s/1y7CluAbCdEfGh'
+    shareUrlInput().dispatchEvent(new Event('input'))
+    await flushPromises()
+    findButton('转存全部').click()
+    await flushPromises()
+
+    expect(transfer.createTransfer).toHaveBeenCalledTimes(1)
+    const req = transfer.createTransfer.mock.calls[0][0] as { owner_uid?: number; save_path?: string }
+    expect(req.owner_uid).toBe(2)
+    expect(req.save_path).toBe('/')
+    wrapper.unmount()
+  })
+  it('跨账号提示随「转存到网盘」开关变化：只下载到本地时不说「保存到网盘」', async () => {
+    authState.hasMultipleAccounts = true
+    const wrapper = await mountDialog()
+    document.body.querySelector<HTMLElement>('.pick-account-2')!.click()
+    await flushPromises()
+    const tip = () => Array.from(document.body.querySelectorAll<HTMLElement>('.form-tip'))
+        .map((el) => el.textContent?.trim() ?? '')
+        .find((t) => t.includes('非当前活跃账号')) ?? ''
+    expect(tip()).toBe('将保存到非当前活跃账号的网盘，订阅也归属该账号')
+
+    const switchIn = (label: string) => Array.from(document.body.querySelectorAll<HTMLElement>('.el-form-item'))
+        .find((el) => el.querySelector('.el-form-item__label')?.textContent?.trim() === label)!
+        .querySelector<HTMLElement>('.el-switch')!
+    switchIn('同步到本地').click()
+    await flushPromises()
+    switchIn('转存到网盘').click()
+    await flushPromises()
+    expect(tip()).toBe('将由非当前活跃账号以分享直下方式下载到本地，订阅也归属该账号')
     wrapper.unmount()
   })
 })
